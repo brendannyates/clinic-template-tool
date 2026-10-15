@@ -1,0 +1,7 @@
+{
+  "name": "clinic-template-tool",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/engine.test.js tests/office-store.test.js"
+  }
+}

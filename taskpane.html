@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Clinic Template Tool</title>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<style>
+:root{
+  --bg:#f4f5f2;--surface:#fdfdfb;--surface2:#ecefe9;--ink:#22262a;--muted:#62686e;--line:#dde1da;
+  --accent:#1f6f6b;--accent-ink:#fff;--accent-soft:#dcefed;
+  --ok:#2f7a45;--ok-soft:#e3f1e6;--warn:#9a6a0b;--warn-soft:#fbf0d6;--bad:#b3261e;--bad-soft:#fbe4e1;
+  --s1:#2a78d6;--q1:#cde2fb;--q2:#9ec5f4;--q3:#6da7ec;--q4:#3987e5;--q5:#256abf;--q6:#184f95;--q7:#0d366b;
+  --radius:12px;--shadow:0 1px 2px rgba(20,40,40,.06),0 2px 8px rgba(20,40,40,.05);
+}
+@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])){
+  --bg:#171a1c;--surface:#202427;--surface2:#2a2f33;--ink:#e9ece8;--muted:#a3aaa6;--line:#363c40;
+  --accent:#5cbcb4;--accent-ink:#10201f;--accent-soft:#1d3533;
+  --ok:#7cc592;--ok-soft:#1f3326;--warn:#e3b75a;--warn-soft:#3a3020;--bad:#f08a80;--bad-soft:#3d2320;
+  --s1:#3987e5;--q1:#1c2b3d;--q2:#184f95;--q3:#1c5cab;--q4:#256abf;--q5:#3987e5;--q6:#6da7ec;--q7:#9ec5f4;--shadow:none}}
+:root[data-theme="dark"]{--bg:#171a1c;--surface:#202427;--surface2:#2a2f33;--ink:#e9ece8;--muted:#a3aaa6;--line:#363c40;--accent:#5cbcb4;--accent-ink:#10201f;--accent-soft:#1d3533;--ok:#7cc592;--ok-soft:#1f3326;--warn:#e3b75a;--warn-soft:#3a3020;--bad:#f08a80;--bad-soft:#3d2320;--s1:#3987e5;--q1:#1c2b3d;--q2:#184f95;--q3:#1c5cab;--q4:#256abf;--q5:#3987e5;--q6:#6da7ec;--q7:#9ec5f4;--shadow:none}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 "Segoe UI",system-ui,-apple-system,sans-serif}
+button,input,select,textarea{font:inherit;color:inherit}
+header.top{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 82%,transparent);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.bar{display:flex;align-items:center;gap:8px;padding:10px 12px 6px}
+.brand{font-weight:700;display:flex;align-items:center;gap:8px;flex:1;min-width:0;white-space:nowrap;overflow:hidden}
+.brand .dot{width:24px;height:24px;border-radius:7px;background:var(--accent);color:var(--accent-ink);display:grid;place-items:center;font-size:11px;font-weight:800;flex:none}
+.brand small{font-weight:500;color:var(--muted);overflow:hidden;text-overflow:ellipsis}
+.iconbtn{border:1px solid var(--line);background:var(--surface);border-radius:10px;min-width:34px;height:34px;display:grid;place-items:center;cursor:pointer;padding:0 8px}
+.iconbtn:hover{border-color:var(--accent)}
+nav.tabs{display:flex;gap:4px;padding:0 8px 8px;overflow-x:auto;scrollbar-width:none}
+nav.tabs button{flex:1 0 auto;border:0;background:transparent;padding:7px 10px;border-radius:10px;cursor:pointer;color:var(--muted);font-weight:600}
+nav.tabs button[aria-current="page"]{background:var(--accent);color:var(--accent-ink)}
+main{padding:12px;max-width:1500px;margin:0 auto}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);padding:12px 14px;margin:0 0 12px}
+.card h2{font-size:15px;margin:0 0 8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.card h2 .sp{flex:1} .card h2 select{font-size:13px;font-weight:500}
+.card h3{font-size:13px;margin:12px 0 6px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+.small{font-size:12.5px}.muted{color:var(--muted)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.btn{border:1px solid var(--line);background:var(--surface);border-radius:10px;padding:6px 12px;cursor:pointer;font-weight:600;min-height:34px}
+.btn:hover{border-color:var(--accent)} .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.btn.sm{min-height:28px;padding:3px 9px;font-size:12.5px;border-radius:8px}
+.btn[disabled]{opacity:.5;cursor:default}
+.filters{display:flex;gap:8px;flex-wrap:wrap;align-items:end;padding:8px 12px 10px}
+.filters label{display:flex;flex-direction:column;font-size:11.5px;color:var(--muted);gap:2px}
+.card h2 select,.filters input,.filters select,.fld input,.fld select{border:1px solid var(--line);background:var(--surface);border-radius:8px;padding:4px 8px;min-height:30px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-bottom:12px}
+.kpi{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:10px 12px}
+.kpi .l{font-size:12px;color:var(--muted)} .kpi .v{font-size:22px;font-weight:700;line-height:1.2} .kpi .s{font-size:11.5px;color:var(--muted)}
+.tw{overflow:auto;max-width:100%}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{padding:5px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+th{font-size:11.5px;color:var(--muted);font-weight:600;position:sticky;top:0;background:var(--surface);cursor:pointer}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+tr.tot td{font-weight:700;border-top:2px solid var(--line)}
+.bar-cell{position:relative}
+.bar-cell i{position:absolute;left:0;top:4px;bottom:4px;background:var(--q1);border-radius:0 4px 4px 0;z-index:0}
+.bar-cell span{position:relative;z-index:1}
+.chip{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;font-weight:700;padding:1px 7px;border-radius:9px;border:1px solid transparent}
+.chip.ok{background:var(--ok-soft);color:var(--ok)} .chip.warn{background:var(--warn-soft);color:var(--warn)} .chip.bad{background:var(--bad-soft);color:var(--bad)} .chip.mute{background:var(--surface2);color:var(--muted)}
+.msg{border-radius:10px;padding:8px 10px;margin:6px 0;font-size:13px}
+.msg.warn{background:var(--warn-soft);color:var(--warn)} .msg.bad{background:var(--bad-soft);color:var(--bad)} .msg.ok{background:var(--ok-soft);color:var(--ok)} .msg.info{background:var(--accent-soft);color:var(--ink)}
+ul.ins{margin:4px 0 0;padding-left:18px} ul.ins li{margin:3px 0}
+.heat td.h{text-align:center;min-width:44px;font-variant-numeric:tabular-nums;border:2px solid var(--surface);border-radius:6px;cursor:default}
+.charts{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
+.chart{position:relative}
+.chart svg{display:block;width:100%;height:auto;overflow:visible}
+.chart .ttl{font-weight:600;font-size:13px;margin-bottom:4px}
+.tip{position:fixed;pointer-events:none;z-index:40;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:5px 8px;font-size:12px;box-shadow:0 4px 14px rgba(0,0,0,.14);white-space:nowrap}
+.cols{display:block} @media(min-width:1000px){.cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:start}}
+#modal{position:fixed;inset:0;background:rgba(10,20,20,.3);-webkit-backdrop-filter:blur(5px);backdrop-filter:blur(5px);z-index:20;display:flex;align-items:center;justify-content:center;padding:3vh 3vw}
+#modal[hidden]{display:none}
+#sheet{background:var(--surface);border:1px solid var(--line);border-radius:14px;max-width:620px;width:100%;max-height:92vh;overflow:auto;padding:16px;box-shadow:0 10px 40px rgba(0,0,0,.25)}
+#sheet h2{margin-top:0;font-size:16px}
+.fld{display:flex;flex-direction:column;gap:3px;margin:8px 0;font-size:12.5px;color:var(--muted)}
+.fld input,.fld select{color:var(--ink);font-size:14px}
+#toast{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:50;display:flex;flex-direction:column;gap:6px;align-items:center}
+#toast div{border-radius:10px;padding:8px 12px;box-shadow:0 4px 14px rgba(0,0,0,.15);font-size:13px;max-width:90vw}
+#busy{position:fixed;inset:0;z-index:30;display:grid;place-items:center;background:rgba(10,20,20,.18);-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px)}
+#busy[hidden]{display:none}
+#busy div{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:12px 16px;font-weight:600}
+.legend{display:flex;gap:4px;align-items:center;font-size:11.5px;color:var(--muted);margin-top:6px}
+.legend i{display:inline-block;width:22px;height:10px;border-radius:3px}
+@media(max-width:520px){.kpi .v{font-size:19px} th,td{padding:4px 6px}}
+@media(max-width:700px){header.top{position:static}}   /* the filter row would cover a narrow task pane */
+</style>
+</head>
+<body>
+<div id="app"><main><div class="card">Loading…</div></main></div>
+<div id="modal" hidden><div id="sheet" role="dialog" aria-modal="true"></div></div>
+<div id="busy" hidden><div id="busyMsg">Working…</div></div>
+<div id="toast"></div>
+<div id="tip" class="tip" hidden></div>
+<script src="engine.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

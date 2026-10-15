@@ -1,0 +1,609 @@
+// Clinic Template Tool: Excel add-in front end. Analysis lives in engine.js (TE).
+'use strict';
+const $ = s => document.querySelector(s);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const pct = (x, d = 0) => x == null || isNaN(x) ? '—' : (x * 100).toFixed(d) + '%';
+const num = x => x == null || isNaN(x) ? '—' : Math.round(x).toLocaleString();
+const days = x => x == null ? '—' : x + (x === 1 ? ' day' : ' days');
+
+const SHEETS = { appt: 'Appointment List', ref: 'Ref', st: 'Slot Types', prov: 'Providers', hist: 'TA 3NA History' };
+const OUT_PREFIX = 'TA ';
+const VIEWS = [['overview', 'Overview'], ['templates', 'Templates'], ['access', 'Access'], ['visits', 'Visits'], ['impact', 'Provider impact'], ['trends', 'Trends'], ['setup', 'Setup']];
+const S = { view: 'overview', data: null, R: null, f: { from: '', to: '', loc: '', prov: '', sl: '' }, opts: { lateHours: 24, target: 14, asOf: '' }, heatMetric: 'fill', trendType: '', impactWhy: '', store: null, mode: 'pane', full: false };
+
+// ---------- small UI helpers ----------
+function toast(kind, html, ms = 5000){ const d = document.createElement('div'); d.className = 'msg ' + kind; d.innerHTML = html; $('#toast').appendChild(d); setTimeout(() => d.remove(), ms); }
+function busy(on, msg){ $('#busy').hidden = !on; if (msg) $('#busyMsg').textContent = msg; }
+function openModal(html){ $('#sheet').innerHTML = html; $('#modal').hidden = false; }
+function closeModal(){ $('#modal').hidden = true; $('#sheet').innerHTML = ''; }
+$('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#modal').hidden) closeModal(); });
+
+// ---------- workbook access ----------
+function OfficeStore(){
+  const CHUNK = 2500;
+  async function readBig(ctx, ws, rows, cols){
+    const out = [];
+    for (let r = 0; r < rows; r += CHUNK){ const g = ws.getRangeByIndexes(r, 0, Math.min(CHUNK, rows - r), cols); g.load('values'); await ctx.sync(); out.push(...g.values); }
+    return out;
+  }
+  async function sheetFor(ctx, name){ const ws = ctx.workbook.worksheets.getItemOrNullObject(name); await ctx.sync(); if (!ws.isNullObject) return { ws, fresh: false }; return { ws: ctx.workbook.worksheets.add(name), fresh: true }; }
+  async function writeRows(ctx, ws, aoa, r0 = 0){
+    const w = Math.max(1, ...aoa.map(r => r.length)); const rows = aoa.map(r => { const x = r.slice(); while (x.length < w) x.push(''); return x.map(v => v == null ? '' : v); });
+    for (let i = 0; i < rows.length; i += 1000){ const part = rows.slice(i, i + 1000); ws.getRangeByIndexes(r0 + i, 0, part.length, w).values = part; await ctx.sync(); }
+    return w;
+  }
+  const settings = () => Office.context.document.settings;
+  return {
+    live: true,
+    load: () => Excel.run(async ctx => {
+      const wss = ctx.workbook.worksheets; wss.load('items/name,items/visibility'); await ctx.sync();
+      const info = wss.items.map(ws => { const u = ws.getUsedRangeOrNullObject(true); u.load('rowCount,columnCount,rowIndex,columnIndex'); return { ws, name: ws.name, hidden: ws.visibility !== 'Visible', u }; });
+      await ctx.sync();
+      const dims = x => x.u.isNullObject ? null : { rows: x.u.rowIndex + x.u.rowCount, cols: x.u.columnIndex + x.u.columnCount };
+      const out = { names: info.map(x => x.name), grids: {}, cfg: {}, appt: null, hidden: info.filter(x => x.hidden).map(x => x.name) };
+      const apptX = info.find(x => !x.hidden && dims(x) && /^(appointment list|appt list)/i.test(x.name)) || info.find(x => dims(x) && /appointment|appt/i.test(x.name) && dims(x).rows > 50);
+      const cfgKey = n => Object.entries(SHEETS).find(([k, v]) => k !== 'appt' && v.toLowerCase() === n.toLowerCase());
+      // templates live on small visible sheets; hidden sheets and report tabs are never read
+      const small = info.filter(x => x !== apptX && dims(x) && !x.hidden && !x.name.startsWith(OUT_PREFIX) && !cfgKey(x.name) && dims(x).rows <= 800 && dims(x).cols <= 80);
+      for (let i = 0; i < small.length; i += 6){
+        const batch = small.slice(i, i + 6).map(x => { const d = dims(x); const g = x.ws.getRangeByIndexes(0, 0, d.rows, d.cols); g.load('values'); return { x, g }; });
+        await ctx.sync(); batch.forEach(b => { out.grids[b.x.name] = b.g.values; });
+      }
+      for (const x of info){ const k = cfgKey(x.name); const d = dims(x); if (k && d) out.cfg[k] = await readBig(ctx, x.ws, d.rows, Math.min(d.cols, 20)); }
+      if (apptX){ const d = dims(apptX); out.appt = { sheet: apptX.name, values: await readBig(ctx, apptX.ws, d.rows, Math.min(d.cols, 60)) }; }
+      return out;
+    }),
+    // replace a sheet's contents (report and config tabs)
+    writeSheet: (name, aoa, fmt = {}) => Excel.run(async ctx => {
+      const { ws } = await sheetFor(ctx, name); ws.getRange().clear(); await ctx.sync();
+      const w = await writeRows(ctx, ws, aoa);
+      const hdr = ws.getRangeByIndexes(0, 0, 1, w); hdr.format.font.bold = true; hdr.format.fill.color = '#DCEFED';
+      for (const [c, f] of Object.entries(fmt.numFmt || {})) if (aoa.length > 1) ws.getRangeByIndexes(1, +c, aoa.length - 1, 1).numberFormat = Array.from({ length: aoa.length - 1 }, () => [f]);
+      ws.freezePanes.freezeRows(1);
+      try { ws.getRangeByIndexes(0, 0, Math.min(aoa.length, 400), w).format.autofitColumns(); } catch {}
+      await ctx.sync();
+    }),
+    replaceAppts: (sheetName, aoa, dateCol) => Excel.run(async ctx => {
+      const { ws } = await sheetFor(ctx, sheetName || SHEETS.appt); ws.getRange().clear(); await ctx.sync();
+      await writeRows(ctx, ws, aoa);
+      if (dateCol != null && aoa.length > 1) ws.getRangeByIndexes(0, dateCol, aoa.length, 1).numberFormat = aoa.map(() => ['m/d/yyyy']);
+      await ctx.sync();
+    }),
+    createTemplate: spec => Excel.run(async ctx => {
+      const ws = ctx.workbook.worksheets.add(spec.sheet);
+      await writeRows(ctx, ws, spec.cells);
+      const n = spec.times.length, last = 6 + n;     // grid rows 7..last (1-based)
+      ws.getRange(`A7:A${last}`).numberFormat = spec.times.map(() => ['h:mm AM/PM']);
+      ws.getRange('B3').numberFormat = [['m/d/yyyy']]; ws.getRange('E3').numberFormat = [['m/d/yyyy']]; ws.getRange('F4').numberFormat = [['m/d/yyyy']];
+      const g = ws.getRange(`B7:F${last}`);
+      ws.getRange('I5').formulas = [[`=IFERROR(SORT(UNIQUE(TOCOL(B7:F${last},1))),"")`]];
+      ws.getRange('J5').formulas = [[`=IF(I5#="","",COUNTIF($B$7:$F$${last},I5#))`]];
+      ws.getRange('K5').formulas = [[`=IF(I5#="","",COUNTIF($B$7:$F$${last},I5#)*${spec.step}/60)`]];
+      ['B', 'C', 'D', 'E', 'F'].forEach((c, i) => { ws.getRange(String.fromCharCode(76 + i) + '5').formulas = [[`=IF($I5#="","",COUNTIF(${c}$7:${c}$${last},$I5#))`]]; });
+      ws.getRange('I2').values = [['Clinical slots / week']];
+      ws.getRange('J2').formulas = [[`=SUMPRODUCT(COUNTIF(B7:F${last},FILTER('${SHEETS.st}'!$A$2:$A$300,'${SHEETS.st}'!$B$2:$B$300="Clinical","~")))`]];
+      ws.getRange('A2').format.font.size = 14; ws.getRange('A2').format.font.bold = true;
+      ['A3', 'D3', 'A4', 'E4', 'A5', 'A6:F6', 'I2', 'I4:P4'].forEach(a => { ws.getRange(a).format.font.bold = true; });
+      ws.getRange('A6:F6').format.fill.color = '#DCEFED'; ws.getRange('I4:P4').format.fill.color = '#DCEFED';
+      const b = g.format.borders; ['EdgeTop', 'EdgeBottom', 'EdgeLeft', 'EdgeRight', 'InsideVertical', 'InsideHorizontal'].forEach(k => { b.getItem(k).style = 'Continuous'; b.getItem(k).color = '#C9CFC7'; });
+      ws.getRange('A:A').format.columnWidth = 70; ws.getRange('B:F').format.columnWidth = 150; ws.getRange('I:I').format.columnWidth = 150;
+      try { g.dataValidation.rule = { list: { inCellDropDown: true, source: `='${SHEETS.st}'!$A$2:$A$300` } }; g.dataValidation.errorAlert = { showAlert: false }; } catch {}
+      ws.activate(); await ctx.sync();
+    }),
+    getDoc: k => { try { return settings().get(k); } catch { return null; } },
+    setDoc: (k, v) => new Promise(res => { try { settings().set(k, v); settings().saveAsync(() => res()); } catch { res(); } }),
+  };
+}
+
+// Full screen: an in-page Office dialog that relays its workbook calls through the pane.
+const CH = 12000;
+function sendChunks(fn, obj){ const s = JSON.stringify(obj); const id = Math.random().toString(36).slice(2); const n = Math.max(1, Math.ceil(s.length / CH)); for (let i = 0; i < n; i++) fn(JSON.stringify({ c: id, i, n, d: s.slice(i * CH, (i + 1) * CH) })); }
+function makeRx(handler){ const buf = {}; return str => { let m; try { m = JSON.parse(str); } catch { return; } if (!m || !m.c) return; const b = buf[m.c] || (buf[m.c] = []); b[m.i] = m.d; if (b.filter(x => x != null).length === m.n){ delete buf[m.c]; try { handler(JSON.parse(b.join(''))); } catch (e){ console.error(e); } } }; }
+const RELAY_OPS = ['load', 'writeSheet', 'replaceAppts', 'createTemplate', 'setDoc'];
+function RemoteStore(){
+  const pend = new Map(); let docs = {};
+  const rx = makeRx(m => { if (m.rid && pend.has(m.rid)){ const p = pend.get(m.rid); pend.delete(m.rid); m.ok ? p.res(m.res) : p.rej(new Error(m.err)); } });
+  Office.context.ui.addHandlerAsync(Office.EventType.DialogParentMessageReceived, a => rx(a.message));
+  const up = obj => sendChunks(s => Office.context.ui.messageParent(s), obj);
+  const call = (op, args) => new Promise((res, rej) => { const rid = Math.random().toString(36).slice(2); pend.set(rid, { res, rej }); up({ rid, op, args }); setTimeout(() => { if (pend.has(rid)){ pend.delete(rid); rej(new Error('Excel didn’t answer. Keep the add-in panel open behind full screen, then try again.')); } }, 120000); });
+  return {
+    live: true, remote: true,
+    async load(){ const d = await call('load'); docs = d.docs || {}; return d; },
+    writeSheet: (...a) => call('writeSheet', a), replaceAppts: (...a) => call('replaceAppts', a), createTemplate: (...a) => call('createTemplate', a),
+    getDoc: k => docs[k] ?? null, async setDoc(k, v){ docs[k] = v; await call('setDoc', [k, v]); },
+    close(){ up({ ev: 'close' }); },
+  };
+}
+let DLG = null;
+function openFull(){
+  if (DLG || S.mode !== 'pane') return;
+  const url = location.href.replace(/[?#].*$/, '') + '?mode=dialog';
+  Office.context.ui.displayDialogAsync(url, { height: 96, width: 96, displayInIframe: true }, res => {
+    if (res.status !== Office.AsyncResultStatus.Succeeded){ toast('bad', 'Couldn’t open full screen: ' + esc(res.error && res.error.message)); return; }
+    DLG = res.value; S.full = true; render();
+    const reply = obj => { try { sendChunks(s => DLG && DLG.messageChild(s), obj); } catch (e){ console.error(e); } };
+    const rx = makeRx(async m => {
+      if (m.ev === 'close'){ try { DLG.close(); } catch {} DLG = null; S.full = false; reload(); return; }
+      const { rid, op, args } = m;
+      try {
+        if (!RELAY_OPS.includes(op)) throw new Error('Unknown request');
+        let r = await S.store[op](...(args || []));
+        if (op === 'load') r = Object.assign({}, r, { docs: { ctOpts: S.store.getDoc('ctOpts'), ctEsk: S.store.getDoc('ctEsk'), ctFilters: S.store.getDoc('ctFilters') } });
+        reply({ rid, ok: true, res: r ?? null });
+      } catch (e){ reply({ rid, ok: false, err: e.message || String(e) }); }
+    });
+    DLG.addEventHandler(Office.EventType.DialogMessageReceived, a => rx(a.message));
+    DLG.addEventHandler(Office.EventType.DialogEventReceived, () => { DLG = null; S.full = false; reload(); });
+  });
+}
+
+// ---------- reading the workbook into the model ----------
+function cfgRows(values, spec){
+  if (!values || !values.length) return [];
+  let hr = values.findIndex(r => r.some(v => Object.values(spec).some(re => re.test(String(v).trim())))); if (hr < 0) return [];
+  const h = values[hr].map(v => String(v).trim()); const idx = {};
+  for (const [k, re] of Object.entries(spec)){ const i = h.findIndex(x => re.test(x)); if (i >= 0) idx[k] = i; }
+  return values.slice(hr + 1).filter(r => r.some(v => String(v).trim())).map(r => Object.fromEntries(Object.entries(idx).map(([k, i]) => [k, r[i]])));
+}
+const SPEC = {
+  ref: { event: /^event$/i, resType: /^resource/i, sched: /schedule\s*class/i, cls: /^event\s*class/i, sl: /^service\s*line/i, elig: /eligible/i },
+  st: { type: /^slot\s*type$|^type$/i, kind: /^kind$/i, accepts: /^accepts?/i, notes: /^notes?$/i },
+  prov: { name: /^nextgen|^provider$/i, label: /template\s*label|^label$/i, cred: /^cred/i, include: /^include/i },
+  hist: { date: /^snapshot/i, prov: /^provider$/i, type: /^slot\s*type$/i, next: /^next/i, third: /^3na/i, open: /^open/i },
+};
+function prepare(raw){
+  const templates = [];
+  for (const [name, values] of Object.entries(raw.grids || {})) templates.push(...TE.parseTemplates(name, values));
+  const ap = raw.appt ? TE.parseAppts(raw.appt.values) : null;
+  if (ap && raw.appt) ap.sheet = raw.appt.sheet;
+  return {
+    names: raw.names || [], hidden: raw.hidden || [], templates, ap,
+    ref: cfgRows(raw.cfg.ref, SPEC.ref), refExists: !!raw.cfg.ref,
+    st: cfgRows(raw.cfg.st, SPEC.st), stExists: !!raw.cfg.st,
+    prov: cfgRows(raw.cfg.prov, SPEC.prov).map(p => ({ name: String(p.name || '').trim(), label: String(p.label || '').trim(), cred: String(p.cred || '').trim(), include: p.include })), provExists: !!raw.cfg.prov,
+    hist: cfgRows(raw.cfg.hist, SPEC.hist).map(h => ({ date: TE.parseDate(h.date), prov: String(h.prov || ''), type: String(h.type || ''), next: h.next === '' ? null : +h.next, third: h.third === '' ? null : +h.third, open: +h.open || 0 })),
+  };
+}
+const stRows = () => S.data.st.length ? S.data.st : TE.DEFAULT_SLOT_TYPES.map(r => ({ type: r[0], kind: r[1], accepts: r[2] }));
+function asOfSerial(){ const o = TE.parseDate(S.opts.asOf); if (o != null) return o; const r = S.data && S.data.ap && S.data.ap.runAt; return r != null ? Math.floor(r) : TE.todaySerial(); }
+function run(){
+  const d = S.data; if (!d || !d.ap || d.ap.error){ S.R = null; return; }
+  const f = S.f; const P = s => TE.parseDate(s);
+  S.R = TE.analyze({
+    templates: d.templates.map(t => Object.assign({}, t)), appts: d.ap.rows, ref: d.ref, slotTypes: stRows(), providers: d.prov,
+    opts: { asOf: asOfSerial(), from: P(f.from), to: P(f.to), lateHours: +S.opts.lateHours || 24, provs: f.prov ? new Set([f.prov]) : null, locs: f.loc ? new Set([f.loc]) : null, sls: f.sl ? new Set([f.sl]) : null },
+  });
+}
+async function reload(){
+  busy(true, 'Reading the workbook…');
+  try {
+    const raw = await S.store.load();
+    S.data = prepare(raw);
+    S.opts = Object.assign(S.opts, S.store.getDoc('ctOpts') || {});
+    S.esk = S.store.getDoc('ctEsk') || null;
+    run(); S.err = null;
+  } catch (e){ console.error(e); S.err = e.message || String(e); }
+  finally { busy(false); render(); }
+}
+
+// ---------- charts ----------
+const CHARTS = {};
+function lineChart(id, title, pts, fmt, yMaxFixed){
+  const W = 360, H = 150, L = 38, R = 10, T = 8, B = 22;
+  const ys = pts.map(p => p.y).filter(y => y != null);
+  if (pts.length < 2 || !ys.length) return `<div class="chart"><div class="ttl">${esc(title)}</div><div class="small muted">Not enough weeks yet.</div></div>`;
+  const yMax = yMaxFixed != null ? yMaxFixed : Math.max(...ys) * 1.1 || 1;
+  const x = i => L + (W - L - R) * i / (pts.length - 1), y = v => T + (H - T - B) * (1 - v / yMax);
+  let d = '', pen = false; pts.forEach((p, i) => { if (p.y == null){ pen = false; return; } d += (pen ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(p.y).toFixed(1); pen = true; });
+  const grid = [0, .5, 1].map(f => `<line x1="${L}" x2="${W - R}" y1="${y(yMax * f)}" y2="${y(yMax * f)}" stroke="var(--line)" stroke-width="1"/><text x="${L - 6}" y="${y(yMax * f) + 4}" text-anchor="end" font-size="10" fill="var(--muted)">${esc(fmt(yMax * f))}</text>`).join('');
+  CHARTS[id] = { pts, fmt, x: pts.map((p, i) => x(i)), y: pts.map(p => p.y == null ? null : y(p.y)), W, H, T, B };
+  return `<div class="chart"><div class="ttl">${esc(title)}</div><svg viewBox="0 0 ${W} ${H}" data-chart="${id}" role="img" aria-label="${esc(title)} by week">${grid}
+    <path d="${d}" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+    <line class="xh" x1="0" x2="0" y1="${T}" y2="${H - B}" stroke="var(--muted)" stroke-width="1" opacity="0"/><circle class="dotp" r="4.5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2" opacity="0"/>
+    <text x="${L}" y="${H - 6}" font-size="10" fill="var(--muted)">${esc(pts[0].x)}</text><text x="${W - R}" y="${H - 6}" font-size="10" text-anchor="end" fill="var(--muted)">${esc(pts[pts.length - 1].x)}</text>
+    <rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="transparent"/></svg></div>`;
+}
+document.addEventListener('mousemove', e => {
+  const svg = e.target.closest && e.target.closest('svg[data-chart]'); const tip = $('#tip');
+  document.querySelectorAll('svg[data-chart] .xh, svg[data-chart] .dotp').forEach(n => { if (!svg || !svg.contains(n)) n.setAttribute('opacity', 0); });
+  if (!svg){ if (!e.target.closest || !e.target.closest('[data-tip]')) tip.hidden = true; else { tip.textContent = e.target.closest('[data-tip]').dataset.tip; tip.hidden = false; tip.style.left = (e.clientX + 12) + 'px'; tip.style.top = (e.clientY + 12) + 'px'; } return; }
+  const c = CHARTS[svg.dataset.chart]; if (!c) return;
+  const r = svg.getBoundingClientRect(); const vx = (e.clientX - r.left) * c.W / r.width;
+  let best = 0; c.x.forEach((xx, i) => { if (Math.abs(xx - vx) < Math.abs(c.x[best] - vx)) best = i; });
+  const p = c.pts[best]; svg.querySelector('.xh').setAttribute('x1', c.x[best]); svg.querySelector('.xh').setAttribute('x2', c.x[best]); svg.querySelector('.xh').setAttribute('opacity', .5);
+  const dot = svg.querySelector('.dotp'); if (c.y[best] != null){ dot.setAttribute('cx', c.x[best]); dot.setAttribute('cy', c.y[best]); dot.setAttribute('opacity', 1); } else dot.setAttribute('opacity', 0);
+  tip.innerHTML = `<b>Week of ${esc(p.x)}</b><br>${esc(p.y == null ? 'No data' : c.fmt(p.y))}${p.sub ? '<br><span class="muted">' + esc(p.sub) + '</span>' : ''}`; tip.hidden = false; tip.style.left = (e.clientX + 12) + 'px'; tip.style.top = (e.clientY + 12) + 'px';
+});
+const SEQ = ['var(--q1)', 'var(--q2)', 'var(--q3)', 'var(--q4)', 'var(--q5)', 'var(--q6)', 'var(--q7)'];
+const seq = f => f == null ? 'transparent' : SEQ[Math.max(0, Math.min(6, Math.floor(f * 7 - 1e-9)))];
+const seqInk = f => f != null && f > 0.57 ? '#fff' : 'var(--ink)';
+const barCell = (v, max, label) => `<td class="n bar-cell"><i style="width:${max ? Math.max(0, Math.min(100, 100 * v / max)) : 0}%"></i><span>${label}</span></td>`;
+
+// ---------- views ----------
+function credOf(n){ const p = (S.data.prov || []).find(x => x.name === n); return (p && p.cred) || TE.credentialOf(n); }
+const target = () => +S.opts.target || 14;
+function threeChip(v){ if (v == null) return '<span class="chip mute">None open</span>'; const t = target(); return `<span class="chip ${v <= t / 2 ? 'ok' : v <= t ? 'warn' : 'bad'}">${days(v)}</span>`; }
+
+function filtersHTML(){
+  const R = S.R, d = S.data; if (!R) return '';
+  const locs = [...new Set(d.ap.rows.map(a => a.loc).filter(Boolean))].sort();
+  const provs = R.people.slice().sort((a, b) => (R.tByProv.has(b) - R.tByProv.has(a)) || a.localeCompare(b));
+  const ref = TE.buildRef(d.ref);
+  const sls = [...new Set([...new Set(d.ap.rows.map(a => a.event))].map(ev => TE.classify(ref, ev).sl).flatMap(s => String(s).split(',').map(x => x.trim())).filter(x => x && x !== 'N/A'))].sort();
+  const opt = (v, cur, label) => `<option value="${esc(v)}"${v === cur ? ' selected' : ''}>${esc(label || v)}</option>`;
+  return `<div class="filters">
+    <label>From<input type="date" data-f="from" value="${esc(S.f.from || TE.iso(R.from))}"></label>
+    <label>To<input type="date" data-f="to" value="${esc(S.f.to || TE.iso(R.to))}"></label>
+    <label>Location<select data-f="loc">${opt('', S.f.loc, 'All locations')}${locs.map(l => opt(l, S.f.loc)).join('')}</select></label>
+    <label>Provider<select data-f="prov">${opt('', S.f.prov, 'All providers')}${provs.map(p => opt(p, S.f.prov, p + (R.tByProv.has(p) ? '' : ' (no template)'))).join('')}</select></label>
+    <label>Service line<select data-f="sl">${opt('', S.f.sl, 'All service lines')}${sls.map(s => opt(s, S.f.sl)).join('')}</select></label>
+    <span class="small muted" style="padding-bottom:6px">As of ${esc(TE.mdy(R.asOf))}${S.data.ap.runAt != null && !S.opts.asOf ? ' (report run time)' : ''}. Weeks run Sun–Sat.</span>
+  </div>`;
+}
+
+function insights(R){
+  const out = [];
+  const typeRows = R.byType.filter(t => t.supply >= 40);
+  for (const t of typeRows.filter(t => t.fit != null && t.fit < 0.5 && t.kept >= 20).sort((a, b) => a.fit - b.fit).slice(0, 2)){
+    const mix = Object.entries(R.offMix[t.key] || {}).sort((a, b) => b[1] - a[1])[0];
+    out.push(`<b>${esc(t.key)}</b> slots: only ${pct(t.fit)} of kept visits were the intended type${mix ? `; most often used for <b>${esc(mix[0])}</b> (${num(mix[1])})` : ''}. Either the slot type or the booking rules need a look.`);
+  }
+  for (const t of typeRows.filter(t => t.fill != null && t.fill < 0.25).sort((a, b) => a.fill - b.fill).slice(0, 2)) out.push(`<b>${esc(t.key)}</b> slots are rarely used: ${pct(t.fill)} filled across ${num(t.supply)} slots. Candidates to convert.`);
+  const hours = R.byHour.filter(h => typeof h.key === 'number' && h.aKept + h.aNS >= 40 && h.nsRate != null).sort((a, b) => b.nsRate - a.nsRate);
+  if (hours[0] && R.total.nsRate != null && hours[0].nsRate > R.total.nsRate * 1.4) out.push(`No-shows peak at <b>${TE.hourLabel(hours[0].key)}</b> (${pct(hours[0].nsRate, 1)} vs ${pct(R.total.nsRate, 1)} overall).`);
+  const dw = R.byDow.filter(x => x.supply >= 40 && x.fill != null).sort((a, b) => a.fill - b.fill);
+  if (dw.length > 1 && dw[dw.length - 1].fill - dw[0].fill > 0.1) out.push(`<b>${esc(dw[0].key)}</b> fills least (${pct(dw[0].fill)}); <b>${esc(dw[dw.length - 1].key)}</b> fills most (${pct(dw[dw.length - 1].fill)}).`);
+  const imp = R.byProv.filter(p => p.inBlocked + p.offTemplate + p.dbl > 0).sort((a, b) => (b.inBlocked + b.offTemplate + b.dbl) - (a.inBlocked + a.offTemplate + a.dbl))[0];
+  if (imp) out.push(`<b>${esc(imp.key)}</b> has the most visits outside clinical template time: ${num(imp.inBlocked)} in admin/lunch/meeting, ${num(imp.offTemplate)} outside template hours or days,${num(imp.dbl)} double-booked (${num(imp.overMin / 60)} h).`);
+  const slow = R.threeNa.filter(x => x.prov !== 'All providers' && x.third != null && x.third > target()).sort((a, b) => b.third - a.third).slice(0, 3);
+  if (slow.length) out.push(`3NA over the ${target()}-day target: ${slow.map(x => `${esc(x.type)} with ${esc(x.prov.split(',')[0])} (${days(x.third)})`).join('; ')}.`);
+  if (!R.hasLate) out.push(`Late cancels can’t be measured yet: the report has no cancel date. Add <b>Cancel Date/Time</b> (and <b>Created Date</b> for lead time and 3NA history) to the NextGen report.`);
+  return out;
+}
+function provTable(R){
+  const rows = R.byProv.filter(p => p.supply || p.aAll).sort((a, b) => (R.tByProv.has(b.key) - R.tByProv.has(a.key)) || b.supply - a.supply || b.aAll - a.aAll);
+  return `<div class="tw"><table><thead><tr><th>Provider</th><th>Cred</th><th class="n">Clinical slots</th><th class="n">Filled</th><th class="n">Kept use</th><th class="n">Template fit</th><th class="n">Open</th><th class="n">To admin</th><th class="n">PTO</th><th class="n">Visits</th><th class="n">No-show</th><th class="n">Cancel</th><th class="n">Late cx</th><th class="n">Outside template</th></tr></thead><tbody>
+  ${rows.map(p => `<tr><td>${esc(p.key)}${R.tByProv.has(p.key) ? '' : ' <span class="chip mute">No template</span>'}</td><td>${esc(credOf(p.key))}</td><td class="n">${p.supply ? num(p.supply) : '—'}</td>${p.supply ? barCell(p.fill, 1, pct(p.fill)) : '<td class="n">—</td>'}<td class="n">${pct(p.util)}</td><td class="n">${pct(p.fit)}</td><td class="n">${p.supply ? num(p.open) : '—'}</td><td class="n">${p.supply ? num(p.admin) : '—'}</td><td class="n">${p.supply ? num(p.pto) : '—'}</td><td class="n">${num(p.aAll)}</td><td class="n">${pct(p.nsRate, 1)}</td><td class="n">${pct(p.cxRate, 1)}</td><td class="n">${R.hasLate ? pct(p.lcRate, 1) : '—'}</td><td class="n">${num(p.inBlocked + p.offTemplate)}</td></tr>`).join('')}
+  </tbody></table></div>`;
+}
+function vOverview(){
+  const R = S.R, t = R.total;
+  const k = (l, v, s) => `<div class="kpi"><div class="l">${l}</div><div class="v">${v}</div><div class="s">${s}</div></div>`;
+  const any = R.threeNa.filter(x => x.prov === 'All providers' && x.third != null).sort((a, b) => b.third - a.third)[0];
+  return `<div class="kpis">
+    ${k('Clinical template slots', num(t.supply), `${TE.mdy(R.from)} – ${TE.mdy(R.to)}`)}
+    ${k('Filled', pct(t.fill), 'slots with a kept or no-show visit')}
+    ${k('Template fit', pct(t.fit), 'kept visits that matched the slot type')}
+    ${k('No-show rate', pct(t.nsRate, 1), `${num(t.aNS)} of ${num(t.aKept + t.aNS)} visits`)}
+    ${k('Cancel rate', pct(t.cxRate, 1), 'all cancels, incl. reschedules')}
+    ${k('Late cancel rate', R.hasLate ? pct(t.lcRate, 1) : '—', R.hasLate ? `within ${S.opts.lateHours} h of the visit` : 'needs cancel date on the report')}
+    ${k('Booked ahead', pct(t.futFill), 'of template slots after the as-of date')}
+    ${k('Longest 3NA', any ? days(any.third) : '—', any ? esc(any.type) + ', all providers' : 'no open slots found')}
+    ${k('Visits outside template', num(t.inBlocked + t.offTemplate), `${num(t.dbl)} double-booked`)}
+  </div>
+  <div class="card"><h2>What stands out</h2><ul class="ins">${insights(R).map(x => `<li>${x}</li>`).join('') || '<li class="muted">Nothing unusual in this range.</li>'}</ul></div>
+  <div class="card"><h2>By provider</h2>${provTable(R)}<div class="small muted" style="margin-top:6px">Filled and template fit use past template slots only. Visit rates count every visit booked on the provider, with or without a template.</div></div>`;
+}
+function vTemplates(){
+  const R = S.R; const st = TE.buildSlotTypes(stRows());
+  const rows = R.byType.filter(t => t.supply || t.futSupply).sort((a, b) => b.supply - a.supply);
+  const maxS = Math.max(1, ...rows.map(r => r.supply));
+  const mixOf = k => { const e = Object.entries(R.offMix[k] || {}).sort((a, b) => b[1] - a[1]).slice(0, 2); return e.map(x => `${esc(x[0])} (${x[1]})`).join(', '); };
+  const heatM = S.heatMetric; const metricOf = c => c ? ({ fill: c.fill, util: c.util, ns: c.nsRate, cx: c.cxRate, kept: c.aKept }[heatM]) : null;
+  const H = new Map(R.heat.map(h => [h.key, h])); const hours = [...new Set(R.heat.filter(h => h.supply || h.futSupply).map(h => +String(h.key).split('|')[1]))].sort((a, b) => a - b);
+  const vals = R.heat.map(metricOf).filter(v => v != null); const maxV = heatM === 'kept' ? Math.max(1, ...vals) : (heatM === 'ns' || heatM === 'cx' ? Math.max(0.01, ...vals) : 1);
+  const fmtV = v => v == null ? '' : heatM === 'kept' ? num(v) : pct(v, heatM === 'ns' ? 1 : 0);
+  const heat = `<div class="tw"><table class="heat"><thead><tr><th></th>${hours.map(h => `<th class="n">${TE.hourLabel(h)}</th>`).join('')}</tr></thead><tbody>${[1, 2, 3, 4, 5].map(d => `<tr><td>${TE.DAYS[d].slice(0, 3)}</td>${hours.map(h => { const c = H.get(d + '|' + h); const v = metricOf(c); const f = v == null ? null : v / maxV; return `<td class="h" style="background:${seq(f)};color:${seqInk(f)}" data-tip="${esc(`${TE.DAYS[d]} ${TE.hourLabel(h)}: ${c ? `${num(c.supply)} slots, ${pct(c.fill)} filled, ${num(c.aKept)} kept, no-show ${pct(c.nsRate, 1)}` : 'no slots'}`)}">${fmtV(v)}</td>`; }).join('')}</tr>`).join('')}</tbody></table></div>
+    <div class="legend">Low <i style="background:linear-gradient(90deg,var(--q1),var(--q4),var(--q7))"></i> High${heatM === 'ns' || heatM === 'cx' ? ` (scale tops out at ${pct(maxV, 1)})` : ''}</div>`;
+  const tplRows = S.data.templates.map(t => ({ t, prov: (R.templates.find(x => x.sheet === t.sheet && x.anchor[0] === t.anchor[0] && x.anchor[1] === t.anchor[1]) || {}).provider }));
+  const wk = t => { let c = 0, b = 0; t.slots.forEach(s => { TE.slotTypeOf(st, s.type).kind === 'clinical' ? c++ : b++; }); return { c, b }; };
+  return `<div class="card"><h2>Slot types</h2><div class="tw"><table><thead><tr><th>Slot type</th><th class="n">Slots</th><th class="n">Filled</th><th class="n">Template fit</th><th class="n">Kept as intended</th><th class="n">Kept, other visit</th><th class="n">No-show</th><th class="n">Open</th><th class="n">To admin</th><th class="n">Booked ahead</th><th>Most common other visits</th></tr></thead><tbody>
+    ${rows.map(r => `<tr><td>${esc(r.key)}${st.get(String(r.key).toLowerCase()) ? '' : ' <span class="chip warn" data-tip="Not on the Slot Types tab; using a guess">?</span>'}</td>${barCell(r.supply, maxS, num(r.supply))}<td class="n">${pct(r.fill)}</td><td class="n">${pct(r.fit)}</td><td class="n">${num(r.keptFit)}</td><td class="n">${num(r.keptOff)}</td><td class="n">${num(r.ns)}</td><td class="n">${num(r.open)}</td><td class="n">${num(r.admin)}</td><td class="n">${pct(r.futFill)}</td><td class="small">${mixOf(r.key)}</td></tr>`).join('')}
+    </tbody></table></div><div class="small muted" style="margin-top:6px">Template fit uses the Accepts column on the Slot Types tab. "To admin" = a clinical slot taken by an admin or meeting event in NextGen. PTO slots are left out of the slot counts.</div></div>
+  <div class="card"><h2>Day of week × time of day <span class="sp"></span><select data-act="heatMetric">${[['fill', 'Filled %'], ['util', 'Kept use %'], ['ns', 'No-show %'], ['cx', 'Cancel %'], ['kept', 'Kept visits']].map(([v, l]) => `<option value="${v}"${v === heatM ? ' selected' : ''}>${l}</option>`).join('')}</select></h2>${heat}</div>
+  <div class="cols"><div class="card"><h2>Morning vs afternoon</h2><table><thead><tr><th></th><th class="n">Slots</th><th class="n">Filled</th><th class="n">Fit</th><th class="n">No-show</th><th class="n">Cancel</th></tr></thead><tbody>${R.byPart.filter(p => p.key !== 'No time').map(p => `<tr><td>${p.key}</td><td class="n">${num(p.supply)}</td><td class="n">${pct(p.fill)}</td><td class="n">${pct(p.fit)}</td><td class="n">${pct(p.nsRate, 1)}</td><td class="n">${pct(p.cxRate, 1)}</td></tr>`).join('')}</tbody></table></div>
+  <div class="card"><h2>Templates in this workbook</h2><div class="tw"><table><thead><tr><th>Tab</th><th>Label</th><th>Linked provider</th><th>Location</th><th>Applies from</th><th class="n">Clinical / wk</th><th class="n">Blocked / wk</th></tr></thead><tbody>${tplRows.map(({ t, prov }) => { const w = wk(t); return `<tr><td>${esc(t.sheet)}</td><td>${esc(t.label)}</td><td>${prov ? esc(prov) : '<span class="chip bad">Not linked</span>'}</td><td>${esc(t.location)}</td><td>${t.effFrom != null ? TE.mdy(t.effFrom) : '<span class="muted">All dates</span>'}</td><td class="n">${w.c}</td><td class="n">${w.b}</td></tr>`; }).join('') || '<tr><td colspan="7" class="muted">No template grids found. Use Setup → New template tab.</td></tr>'}</tbody></table></div>
+  <div class="small muted" style="margin-top:6px">A template with no Effective From date applies to every date. Add one when a provider’s template changes, and keep the old tab so earlier weeks are measured against the template that was in place.</div></div></div>`;
+}
+function vAccess(){
+  const R = S.R;
+  const all = R.threeNa.filter(x => x.prov === 'All providers'); const per = R.threeNa.filter(x => x.prov !== 'All providers');
+  const tbl = rows => `<table><thead><tr><th>Provider</th><th>Slot type</th><th class="n">Next available</th><th class="n">3NA</th><th class="n">Open slots ahead</th><th>Third open slot</th></tr></thead><tbody>${rows.map(x => `<tr><td>${esc(x.prov)}</td><td>${esc(x.type)}</td><td class="n">${days(x.next)}</td><td class="n">${threeChip(x.third)}</td><td class="n">${num(x.open)}</td><td>${x.thirdDate != null ? TE.mdy(x.thirdDate) : x.full ? '<span class="muted">Fully booked to end of report</span>' : ''}</td></tr>`).join('')}</tbody></table>`;
+  const fut = R.byWeek.filter(w => w.futSupply).slice(0, 12);
+  // 3NA trend: saved snapshots, or rebuilt weekly when the report has created dates
+  const types = [...new Set([...(S.data.hist || []).map(h => h.type), ...((R.threeNaHist || []).map(h => h.type))])].sort();
+  const tt = S.trendType && types.includes(S.trendType) ? S.trendType : (types.includes('Any clinical slot') ? 'Any clinical slot' : types[0]);
+  let trend = '';
+  if (R.threeNaHist && tt){ const pts = R.threeNaHist.filter(h => h.type === tt).map(h => ({ x: TE.mdy(h.week), y: h.third })); trend = lineChart('t3na', `3NA, ${tt} (rebuilt from created dates)`, pts, v => Math.round(v) + ' d'); }
+  else if (tt){ const byD = new Map(); (S.data.hist || []).filter(h => h.type === tt && h.prov === 'All providers').forEach(h => byD.set(h.date, h.third)); const pts = [...byD.entries()].sort((a, b) => a[0] - b[0]).map(([d, v]) => ({ x: TE.mdy(d), y: v })); trend = lineChart('t3na', `3NA, ${tt} (saved snapshots)`, pts, v => Math.round(v) + ' d'); }
+  const esk = S.esk ? eskCard() : '';
+  return `<div class="card"><h2>Third next available (3NA)<span class="sp"></span><button class="btn sm" data-act="snapshot">Save 3NA snapshot</button></h2>
+    <div class="small muted">Calendar days from ${TE.mdy(R.asOf)} to the third open template slot of each type. Open = no Kept, Expected or No Show visit on the report, and no PTO or admin booked. Target: ${target()} days (change in Setup).</div>
+    <h3>All providers</h3><div class="tw">${tbl(all)}</div><h3>By provider</h3><div class="tw">${tbl(per)}</div>
+    <div class="small muted" style="margin-top:6px">Each slot counts once. A visit that needs two slots in a row (for example a 60-minute consult) may wait longer than this shows.</div></div>
+  <div class="cols"><div class="card"><h2>Booked ahead by week</h2><table><thead><tr><th>Week of</th><th class="n">Template slots</th><th class="n">Booked</th><th class="n">Booked %</th></tr></thead><tbody>${fut.map(w => `<tr><td>${TE.mdy(w.key)}</td><td class="n">${num(w.futSupply)}</td><td class="n">${num(w.futBooked)}</td>${barCell(w.futFill, 1, pct(w.futFill))}</tr>`).join('') || '<tr><td colspan="4" class="muted">No future weeks on the report.</td></tr>'}</tbody></table></div>
+  <div class="card"><h2>3NA over time<span class="sp"></span>${types.length ? `<select data-act="trendType">${types.map(t => `<option${t === tt ? ' selected' : ''}>${esc(t)}</option>`).join('')}</select>` : ''}</h2>${trend || `<div class="small muted">${R.hasBooked ? '' : 'Save a snapshot each week (it’s stored on the TA 3NA History tab), or add Created Date to the NextGen report so the tool can rebuild past weeks.'}</div>`}</div></div>${esk}`;
+}
+function eskCard(){
+  const m = S.esk, R = S.R; const st = TE.buildSlotTypes(stRows());
+  const eskSlots = prov => { const list = R.tByProv.get(prov) || []; const t = list[list.length - 1]; if (!t) return null; return t.slots.filter(s => { const x = TE.slotTypeOf(st, s.type); return !x.any && TE.accepts(x, { cls: 'EFU', event: 'Esketamine Follow Up', sl: 'ESK' }); }).length; };   // dedicated ESK slots; Open Schedule would overstate it
+  const rows = (m.providers || []).map(p => { const nm = TE.matchProvider(String(p.Provider || ''), R.people) || String(p.Provider || ''); return { p, nm, ours: eskSlots(nm) }; });
+  return `<div class="card"><h2>${esc(m.modality || 'ESK')} access model <span class="chip mute">${esc(m.clinic || '')} · ${esc(String(m.generated || '').slice(0, 10))}</span></h2>
+    <div class="tw"><table><thead><tr><th>Provider (tracker)</th><th>Matched to</th><th>Cred</th><th class="n">Patients</th><th class="n">Need / wk</th><th class="n">Tracker template slots / wk</th><th class="n">ESK slots / wk in this template</th><th class="n">Booked / wk</th></tr></thead><tbody>
+    ${rows.map(({ p, nm, ours }) => `<tr><td>${esc(p.Provider)}</td><td>${esc(nm)}</td><td>${esc(p.Credential)}</td><td class="n">${num(+p.Patients)}</td><td class="n">${esc(p['Need per week'])}</td><td class="n">${esc(p['Template slots per week'])}</td><td class="n">${ours == null ? '—' : ours}</td><td class="n">${esc(p['Booked per week'])}</td></tr>`).join('')}
+    </tbody></table></div><div class="small muted" style="margin-top:6px">From the ESK Tracker’s Access export. Need per week is the panel’s expected visits; compare it with the slots this template workbook gives ESK.</div></div>`;
+}
+function rateTable(rows, label, showLead){
+  const R = S.R; const max = Math.max(1, ...rows.map(r => r.aAll));
+  return `<div class="tw"><table><thead><tr><th>${label}</th><th class="n">Visits</th><th class="n">Kept</th><th class="n">No-show</th><th class="n">Cancel</th><th class="n">Late cx</th>${showLead ? '<th class="n">Median lead</th>' : ''}</tr></thead><tbody>
+  ${rows.map(r => `<tr><td>${esc(r.key)}</td>${barCell(r.aAll, max, num(r.aAll))}<td class="n">${num(r.aKept)}</td><td class="n">${pct(r.nsRate, 1)}</td><td class="n">${pct(r.cxRate, 1)}</td><td class="n">${R.hasLate ? pct(r.lcRate, 1) : '—'}</td>${showLead ? `<td class="n">${r.leadMed == null ? '—' : days(Math.round(r.leadMed))}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+}
+function vVisits(){
+  const R = S.R, lead = R.hasBooked;
+  const srt = a => a.filter(r => r.aAll).sort((x, y) => y.aAll - x.aAll);
+  const hrs = R.byHour.filter(h => typeof h.key === 'number' && h.aAll).sort((a, b) => a.key - b.key).map(h => Object.assign({}, h, { key: TE.hourLabel(h.key) }));
+  const dws = [1, 2, 3, 4, 5, 6, 0].map(d => R.byDow.find(x => x.key === TE.DAYS[d])).filter(x => x && x.aAll);
+  return `<div class="cols"><div class="card"><h2>By service line</h2>${rateTable(srt(R.bySL), 'Service line', lead)}</div><div class="card"><h2>By visit class</h2>${rateTable(srt(R.byClass), 'Event class', lead)}</div></div>
+  <div class="card"><h2>By appointment type</h2>${rateTable(srt(R.byEvent), 'Event', lead)}</div>
+  <div class="cols"><div class="card"><h2>By day of week</h2>${rateTable(dws, 'Day', lead)}</div><div class="card"><h2>By start time</h2>${rateTable(hrs, 'Hour', lead)}</div></div>
+  <div class="small muted">Providers only (chairs and rooms are left out). Rates use past dates in the range. ${lead ? 'Lead time = days from booking to the visit.' : 'Add Created Date to the report to see lead time.'}</div>`;
+}
+function vImpact(){
+  const R = S.R;
+  const byP = new Map(); for (const e of R.exceptions){ const k = e.prov; const x = byP.get(k) || { blocked: 0, lunch: 0, off: 0, noday: 0, dbl: 0, min: 0, days: new Set() }; if (/Lunch/.test(e.why)) x.lunch++; if (/^In |Runs into/.test(e.why)) x.blocked++; if (/Outside template hours/.test(e.why)) x.off++; if (/No template that day/.test(e.why)) x.noday++; if (/Double-booked/.test(e.why)) x.dbl++; x.min += e.min || 0; x.days.add(e.date); byP.set(k, x); }
+  const provs = [...R.tByProv.keys()].filter(p => !S.f.prov || p === S.f.prov);
+  const kept = p => (R.byProv.find(x => x.key === p) || {}).aKept || 0;
+  const whys = ['', 'In Lunch', 'In Admin', 'In Meeting', 'Runs into', 'Outside template hours', 'No template that day', 'Double-booked'];
+  const ex = R.exceptions.filter(e => !S.impactWhy || e.why.includes(S.impactWhy));
+  return `<div class="card"><h2>How much the schedule leans on the provider</h2><div class="tw"><table><thead><tr><th>Provider</th><th class="n">Kept visits</th><th class="n">In admin / lunch / meeting</th><th class="n">…of those in lunch</th><th class="n">Outside template hours</th><th class="n">On a non-template day</th><th class="n">Double-booked</th><th class="n">Extra hours</th><th class="n">Days affected</th></tr></thead><tbody>
+    ${provs.map(p => { const x = byP.get(p) || { blocked: 0, lunch: 0, off: 0, noday: 0, dbl: 0, min: 0, days: new Set() }; return `<tr><td>${esc(p)}</td><td class="n">${num(kept(p))}</td><td class="n">${num(x.blocked)}</td><td class="n">${num(x.lunch)}</td><td class="n">${num(x.off)}</td><td class="n">${num(x.noday)}</td><td class="n">${num(x.dbl)}</td><td class="n">${(x.min / 60).toFixed(1)}</td><td class="n">${num(x.days.size)}</td></tr>`; }).join('')}
+    </tbody></table></div><div class="small muted" style="margin-top:6px">Kept, expected and no-show visits on past dates. Extra hours = visit minutes that fall in blocked time or outside the template.</div></div>
+  <div class="card"><h2>Visits outside the template <span class="sp"></span><select data-act="impactWhy">${whys.map(w => `<option value="${esc(w)}"${w === S.impactWhy ? ' selected' : ''}>${w || 'All reasons'}</option>`).join('')}</select></h2>
+    <div class="tw" style="max-height:480px"><table><thead><tr><th>Date</th><th>Time</th><th>Provider</th><th>Event</th><th>Status</th><th>Why</th></tr></thead><tbody>${ex.slice(0, 400).map(e => `<tr><td>${TE.mdy(e.date)}</td><td>${TE.hhmm(e.time)}</td><td>${esc(e.prov)}</td><td>${esc(e.event)}</td><td>${esc(e.status)}</td><td>${esc(e.why)}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">None in this range.</td></tr>'}</tbody></table></div>
+    ${ex.length > 400 ? `<div class="small muted">Showing 400 of ${num(ex.length)}. Write report tabs for the full list.</div>` : ''}</div>`;
+}
+function vTrends(){
+  const R = S.R; const wk = R.byWeek.filter(w => w.key >= R.from && w.key + 6 <= R.to && (w.supply || w.aAll));   // whole weeks only; a partial first or last week skews every rate
+  const P = f => wk.map(w => ({ x: TE.mdy(w.key), y: f(w), sub: `${num(w.supply)} slots · ${num(w.aAll)} visits` }));
+  return `<div class="card"><h2>Weekly trends</h2><div class="charts">
+    ${lineChart('c1', 'Filled %', P(w => w.fill), v => pct(v), 1)}
+    ${lineChart('c2', 'Template fit %', P(w => w.fit), v => pct(v), 1)}
+    ${lineChart('c3', 'No-show rate', P(w => w.nsRate), v => pct(v, 1))}
+    ${lineChart('c4', 'Cancel rate', P(w => w.cxRate), v => pct(v, 1))}
+    ${R.hasLate ? lineChart('c5', 'Late cancel rate', P(w => w.lcRate), v => pct(v, 1)) : ''}
+    ${lineChart('c6', 'Kept visits', P(w => w.aKept), v => num(v))}
+    ${lineChart('c7', 'Visits outside template', P(w => w.inBlocked + w.offTemplate), v => num(v))}
+  </div><div class="small muted" style="margin-top:6px">Whole weeks only (Sunday to Saturday) inside the From–To range. Hover a chart for the week’s value. Filters above apply.</div></div>`;
+}
+function vSetup(){
+  const d = S.data, ap = d.ap, R = S.R;
+  const has = ap && !ap.error ? ap.has : {};
+  const flag = (ok, t) => `<span class="chip ${ok ? 'ok' : 'warn'}">${ok ? '✓' : '—'} ${t}</span>`;
+  const linkRows = d.templates.map(t => { const tt = R && R.templates.find(x => x.sheet === t.sheet && x.anchor[0] === t.anchor[0] && x.anchor[1] === t.anchor[1]); return { t, prov: tt && tt.provider }; });
+  return `<div class="card"><h2>Appointment list</h2>
+    ${!ap ? `<div class="msg warn">No Appointment List tab yet. Import the NextGen appointment report below.</div>` : ap.error ? `<div class="msg bad">${esc(ap.error)} (tab “${esc(ap.sheet)}”)</div>` :
+    `<div class="small">Tab <b>${esc(ap.sheet)}</b>: ${num(ap.rows.length)} visits, ${TE.mdy(ap.min)} – ${TE.mdy(ap.max)}${ap.runAt != null ? `, report run ${TE.mdy(ap.runAt)} ${TE.hhmm(Math.round((ap.runAt % 1) * 1440))}` : ''}.</div>
+     <div class="row" style="margin:6px 0">${flag(true, 'Date, time, provider, event, status')}${flag(has.dur, 'Duration / end time')}${flag(has.loc, 'Location')}${flag(has.cancel, 'Cancel date/time')}${flag(has.booked, 'Created date')}</div>
+     ${has.cancel && has.booked ? '' : `<div class="msg info">Add <b>${[!has.cancel && 'Cancel Date and Cancel Time', !has.booked && 'Created Date (when the visit was booked)'].filter(Boolean).join('</b> and <b>')}</b> to the NextGen report. ${!has.cancel ? 'Cancel date/time is what separates late cancels from early ones. ' : ''}${!has.booked ? 'Created date gives lead time and lets the tool rebuild 3NA for past weeks.' : ''}</div>`}`}
+    <div class="row"><label class="btn primary">Import NextGen report…<input type="file" accept=".xls,.xlsx,.csv" data-act="importAppts" hidden></label><span class="small muted">Replaces the Appointment List tab. Use the full date range you want to study plus the weeks ahead.</span></div></div>
+  <div class="card"><h2>Provider templates<span class="sp"></span><button class="btn sm primary" data-act="newTemplate">New template tab</button></h2>
+    <div class="small muted">Every visible tab is scanned for a weekly grid: a Monday–Friday header row, times down the left, slot types in the cells, and Provider:/Location:/Effective From: labels above. The New template tab button makes one in the standard layout; you can also paste a copy of an existing template.</div>
+    <table style="margin-top:6px"><thead><tr><th>Tab</th><th>Label</th><th>Linked to</th><th>Slots</th><th>Hours</th></tr></thead><tbody>${linkRows.map(({ t, prov }) => `<tr><td>${esc(t.sheet)}</td><td>${esc(t.label || '(no label)')}</td><td>${prov ? esc(prov) : '<span class="chip bad">Not linked</span> <span class="small muted">set it on the Providers tab</span>'}</td><td>${t.slots.length} × ${t.step} min</td><td>${TE.hhmm(t.start)}–${TE.hhmm(t.end)}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">None found.</td></tr>'}</tbody></table>
+    ${d.hidden.length ? `<div class="small muted" style="margin-top:6px">Hidden tabs aren’t read: ${d.hidden.map(esc).join(', ')}.</div>` : ''}</div>
+  <div class="card"><h2>Lookup tabs</h2>
+    <table><tbody>
+      <tr><td><b>${SHEETS.st}</b></td><td class="small">Slot type → Clinical or Blocked, and which visits it accepts (event class, service line or event; comma = any of, + = all of, * = anything).</td><td>${d.stExists ? flag(true, `${d.st.length} rows`) : flag(false, 'Using built-in defaults')}</td><td><button class="btn sm" data-act="cfgSt">${d.stExists ? 'Add missing types' : 'Create'}</button></td></tr>
+      <tr><td><b>${SHEETS.ref}</b></td><td class="small">NextGen event → event class, service line, and whether it counts (holds and reference rows don’t).</td><td>${d.refExists ? flag(!(R && R.unmapped.length), R && R.unmapped.length ? `${R.unmapped.length} events not listed` : `${d.ref.length} rows`) : flag(false, 'Missing')}</td><td><button class="btn sm" data-act="cfgRef">${d.refExists ? 'Add missing events' : 'Create'}</button></td></tr>
+      <tr><td><b>${SHEETS.prov}</b></td><td class="small">NextGen provider → template label, credential, include. Leave Include blank to let the tool decide (people yes, chairs and rooms no).</td><td>${d.provExists ? flag(true, `${d.prov.length} rows`) : flag(false, 'Missing')}</td><td><button class="btn sm" data-act="cfgProv">${d.provExists ? 'Add missing providers' : 'Create'}</button></td></tr>
+    </tbody></table>
+    ${R && R.unknownTypes.length ? `<div class="msg warn">Slot types in templates but not on ${SHEETS.st}: ${R.unknownTypes.map(x => esc(x.type)).join(', ')}.</div>` : ''}</div>
+  <div class="cols"><div class="card"><h2>Settings</h2>
+    <div class="fld">Late cancel window (hours before the visit)<input type="number" min="1" max="168" data-o="lateHours" value="${esc(S.opts.lateHours)}"></div>
+    <div class="fld">3NA target (days)<input type="number" min="1" max="120" data-o="target" value="${esc(S.opts.target)}"></div>
+    <div class="fld">As-of date (blank = report run time)<input type="date" data-o="asOf" value="${esc(S.opts.asOf)}"></div></div>
+  <div class="card"><h2>Share results</h2><div class="small muted">Writes summary tabs (prefixed “TA ”) with the current filters. Counts only, no patient fields. Safe to share with anyone who can open this workbook.</div>
+    <div class="row" style="margin-top:8px"><button class="btn primary" data-act="writeReports">Write report tabs</button><button class="btn" data-act="snapshot">Save 3NA snapshot</button></div>
+    <h3>ESK access model</h3><div class="small muted">Import the export from the ESK Tracker’s Access tab (Export for template tool). Only the summary tabs are read; patient tabs in that file are ignored.</div>
+    <div class="row" style="margin-top:6px"><label class="btn">Import access model…<input type="file" accept=".xlsx" data-act="importEsk" hidden></label>${S.esk ? `<span class="small muted">Loaded: ${esc(S.esk.modality)} · ${esc(S.esk.clinic)} · ${esc(String(S.esk.generated).slice(0, 10))}</span>` : ''}</div></div></div>`;
+}
+
+function render(){
+  for (const k in CHARTS) delete CHARTS[k];
+  if (S.err) { $('#app').innerHTML = `<main><div class="card"><h2>Can’t read the workbook</h2><div class="msg bad">${esc(S.err)}</div><button class="btn primary" data-act="refresh">Try again</button></div></main>`; return; }
+  if (!S.data) return;
+  const ready = !!S.R; const view = ready ? S.view : 'setup';
+  const body = { overview: vOverview, templates: vTemplates, access: vAccess, visits: vVisits, impact: vImpact, trends: vTrends, setup: vSetup }[view]();
+  $('#app').innerHTML = `<header class="top"><div class="bar"><div class="brand"><span class="dot">CT</span><span>Clinic Template Tool</span><small>${S.R ? `${S.R.tByProv.size} templates · ${num(S.data.ap.rows.length)} visits` : ''}</small></div>
+    <button class="iconbtn" data-act="refresh" title="Re-read the workbook" aria-label="Refresh">⟳</button>
+    ${S.mode === 'pane' && S.canFull ? `<button class="iconbtn" data-act="full" title="Full screen" aria-label="Full screen">⛶</button>` : ''}${S.mode === 'dialog' ? `<button class="iconbtn" data-act="closeFull" title="Close full screen" aria-label="Close full screen">✕</button>` : ''}</div>
+    <nav class="tabs">${VIEWS.map(([k, l]) => `<button data-view="${k}"${k === view ? ' aria-current="page"' : ''}${!ready && k !== 'setup' ? ' disabled' : ''}>${l}</button>`).join('')}</nav>
+    ${ready && view !== 'setup' ? filtersHTML() : ''}</header><main>${!ready && view === 'setup' && S.data.ap && !S.data.ap.error ? '' : ''}${body}</main>`;
+}
+
+// ---------- actions ----------
+document.addEventListener('click', async e => {
+  const v = e.target.closest('[data-view]'); if (v && !v.disabled){ S.view = v.dataset.view; render(); window.scrollTo(0, 0); return; }
+  const a = e.target.closest('[data-act]'); if (!a || a.tagName === 'SELECT' || a.tagName === 'INPUT') return;
+  const act = a.dataset.act;
+  try {
+    if (act === 'refresh') await reload();
+    else if (act === 'full') openFull();
+    else if (act === 'closeFull') S.store.close();
+    else if (act === 'newTemplate') newTemplateDialog();
+    else if (act === 'makeTemplate') await makeTemplate();
+    else if (act === 'close') closeModal();
+    else if (act === 'cfgSt') await writeSlotTypes();
+    else if (act === 'cfgRef') await writeRef();
+    else if (act === 'cfgProv') await writeProviders();
+    else if (act === 'writeReports') await writeReports();
+    else if (act === 'snapshot') await saveSnapshot();
+    else if (act === 'dlManifest') downloadManifest();
+  } catch (err){ console.error(err); busy(false); toast('bad', esc(err.message || String(err)), 9000); }
+});
+document.addEventListener('change', async e => {
+  const t = e.target;
+  if (t.dataset.f){ S.f[t.dataset.f] = t.value; run(); render(); return; }
+  if (t.dataset.o){ S.opts[t.dataset.o] = t.type === 'number' ? +t.value : t.value; await S.store.setDoc('ctOpts', S.opts); run(); render(); return; }
+  const act = t.dataset.act;
+  try {
+    if (act === 'heatMetric'){ S.heatMetric = t.value; render(); }
+    else if (act === 'trendType'){ S.trendType = t.value; render(); }
+    else if (act === 'impactWhy'){ S.impactWhy = t.value; render(); }
+    else if (act === 'importAppts' && t.files[0]) await importAppts(t.files[0]);
+    else if (act === 'importEsk' && t.files[0]) await importEsk(t.files[0]);
+    else if (act === 'tplCopy') fillTemplateDefaults();
+  } catch (err){ console.error(err); busy(false); toast('bad', esc(err.message || String(err)), 9000); }
+});
+
+let xlsxP = null;
+function loadXLSX(){ return xlsxP || (xlsxP = new Promise(res => { if (window.XLSX) return res(true); const s = document.createElement('script'); s.src = 'assets/xlsx.full.min.js'; s.onload = () => res(!!window.XLSX); s.onerror = () => { xlsxP = null; res(false); }; document.head.appendChild(s); })); }
+async function readFileAoa(file){
+  if (!(await loadXLSX())) throw new Error('Couldn’t load the spreadsheet reader. Check the connection and try again.');
+  const wb = XLSX.read(await file.arrayBuffer(), { type: 'array', cellDates: false, raw: false });
+  return wb;
+}
+async function importAppts(file){
+  busy(true, 'Reading the report…');
+  const wb = await readFileAoa(file);
+  let best = null;
+  for (const n of wb.SheetNames){ const aoa = XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: '' }); const h = TE.findHeader(aoa); if (h){ best = { aoa, h }; break; } }
+  busy(false);
+  if (!best) throw new Error('That file has no Appt Date / Provider / Event / Status header row. Use the NextGen Appointments Listing report.');
+  // keep only columns that have something in them
+  const W = Math.max(...best.aoa.map(r => r.length)); const keepC = []; for (let c = 0; c < W; c++) if (best.aoa.some(r => String(r[c] ?? '').trim())) keepC.push(c);
+  const aoa = best.aoa.map(r => keepC.map(c => r[c] ?? ''));
+  const parsed = TE.parseAppts(aoa);
+  if (!confirm(`Replace the ${S.data.ap ? `“${S.data.ap.sheet}”` : 'Appointment List'} tab with ${parsed.rows.length.toLocaleString()} visits (${TE.mdy(parsed.min)} – ${TE.mdy(parsed.max)})?`)) return;
+  busy(true, `Writing ${parsed.rows.length.toLocaleString()} visits…`);
+  await S.store.replaceAppts(S.data.ap ? S.data.ap.sheet : SHEETS.appt, aoa, keepC.indexOf(best.h.cols.date) >= 0 ? keepC.indexOf(best.h.cols.date) : null);
+  busy(false); toast('ok', 'Appointment list updated.'); await reload();
+}
+async function importEsk(file){
+  const wb = await readFileAoa(file);
+  const sheets = {}; for (const n of ['About', 'Providers', 'DayPart', 'Frequencies', 'Weekly']) if (wb.Sheets[n]) sheets[n] = XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: '' });
+  const m = TE.readAccessModel(sheets); if (m.error) throw new Error(m.error);
+  delete m.weekly;   // keep the stored copy small
+  S.esk = m; await S.store.setDoc('ctEsk', m); toast('ok', `Loaded the ${esc(m.modality)} access model (${m.providers.length} providers).`); S.view = 'access'; render();
+}
+
+// lookup tabs: create or top up, never overwrite what a PM typed
+async function writeSlotTypes(){
+  const have = new Set(S.data.st.map(r => String(r.type).toLowerCase()));
+  const base = S.data.stExists ? S.data.st.map(r => [r.type, r.kind, r.accepts, r.notes || '']) : TE.DEFAULT_SLOT_TYPES.map(r => r.slice());
+  const inBase = new Set(base.map(r => String(r[0]).toLowerCase()));
+  for (const t of S.data.templates) for (const s of t.slots){ const k = s.type.toLowerCase(); if (!inBase.has(k)){ inBase.add(k); const g = TE.slotTypeOf(new Map(), s.type); base.push([s.type, g.kind === 'blocked' ? 'Blocked' : 'Clinical', g.any ? '*' : '', 'Added from a template; fill in Accepts']); } }
+  busy(true, 'Writing Slot Types…'); await S.store.writeSheet(SHEETS.st, [['Slot type', 'Kind', 'Accepts', 'Notes']].concat(base)); busy(false);
+  toast('ok', `${SHEETS.st} tab has ${base.length} slot types.`); await reload();
+}
+async function writeRef(){
+  const R = S.R; const rows = S.data.ref.map(r => [r.event, r.resType, r.sched, r.cls, r.sl, r.elig]);
+  const seen = new Set(rows.map(r => String(r[0]).toLowerCase()));
+  const events = S.data.ap && !S.data.ap.error ? [...new Set(S.data.ap.rows.map(a => a.event).filter(Boolean))] : [];
+  let added = 0;
+  for (const ev of events.sort()) if (!seen.has(ev.toLowerCase())){ const g = TE.classify(new Map(), ev); rows.push([ev, 'Provider', g.kind === 'ignore' ? 'Reference/Hold Only' : g.kind === 'nonpt' ? 'Admin' : 'Clinical', g.cls, g.sl, g.kind === 'ignore' ? 'No' : 'Always']); added++; }
+  busy(true, 'Writing Ref…'); await S.store.writeSheet(SHEETS.ref, [['Event', 'Resource Type', 'Schedule Classification', 'Event Class', 'Service Line', 'Template Eligible']].concat(rows)); busy(false);
+  toast('ok', added ? `Added ${added} events to ${SHEETS.ref}. Check their Event Class and Service Line.` : `${SHEETS.ref} already lists every event.`); await reload();
+}
+async function writeProviders(){
+  const R = S.R; const rows = S.data.prov.map(p => [p.name, p.label, p.cred, p.include ?? '']);
+  const seen = new Set(rows.map(r => r[0]));
+  const names = S.data.ap && !S.data.ap.error ? [...new Set(S.data.ap.rows.map(a => a.prov).filter(Boolean))].sort() : [];
+  for (const n of names) if (!seen.has(n)){ const t = R && R.templates.find(x => x.provider === n); rows.push([n, t ? t.label : '', TE.credentialOf(n), TE.isPersonResource(n) ? '' : 'No']); }
+  busy(true, 'Writing Providers…'); await S.store.writeSheet(SHEETS.prov, [['NextGen provider', 'Template label', 'Credential', 'Include']].concat(rows)); busy(false);
+  toast('ok', `${SHEETS.prov} tab has ${rows.length} rows.`); await reload();
+}
+
+// new template tab in the standard (provider configurable) layout
+function newTemplateDialog(){
+  const R = S.R; const people = R ? R.people.slice().sort() : [];
+  openModal(`<h2>New template tab</h2>
+    <div class="fld">Provider (as in NextGen)<select id="tpProv">${people.map(p => `<option>${esc(p)}</option>`).join('')}<option value="">Someone not on the report…</option></select></div>
+    <div class="fld">Label on the template (usually last name)<input id="tpLabel"></div>
+    <div class="fld">Location<input id="tpLoc"></div>
+    <div class="fld">Effective from<input id="tpFrom" type="date" value="${TE.iso(TE.todaySerial())}"></div>
+    <div class="row"><div class="fld" style="flex:1">Day starts<input id="tpStart" type="time" value="08:00"></div><div class="fld" style="flex:1">Day ends<input id="tpEnd" type="time" value="18:00"></div><div class="fld" style="flex:1">Slot length (min)<input id="tpStep" type="number" value="30" min="5" max="120"></div></div>
+    <div class="fld">Start from<select id="tpCopy" data-act="tplCopy"><option value="">A blank grid</option>${S.data.templates.map((t, i) => `<option value="${i}">${esc(t.sheet)} · ${esc(t.label)}</option>`).join('')}</select></div>
+    <div class="small muted">Copying an existing template is how you record a revision: give the copy a new Effective From date and edit it. The old tab keeps measuring the weeks before.</div>
+    <div class="row" style="margin-top:12px"><button class="btn primary" data-act="makeTemplate">Create tab</button><button class="btn" data-act="close">Cancel</button></div>`);
+  const sync = () => { const p = $('#tpProv').value; $('#tpLabel').value = p ? (TE.lastName(p).replace(/^./, c => c.toUpperCase())) : ''; const locs = {}; (S.data.ap.rows || []).filter(a => a.prov === p && a.loc).forEach(a => { locs[a.loc] = (locs[a.loc] || 0) + 1; }); $('#tpLoc').value = Object.entries(locs).sort((a, b) => b[1] - a[1]).map(x => x[0])[0] || ''; };
+  $('#tpProv').addEventListener('change', sync); sync();
+}
+function fillTemplateDefaults(){ const i = $('#tpCopy').value; if (i === '') return; const t = S.data.templates[+i]; $('#tpStart').value = hm(t.start); $('#tpEnd').value = hm(t.end); $('#tpStep').value = t.step; if (t.location) $('#tpLoc').value = t.location; }
+const hm = m => String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0');
+async function makeTemplate(){
+  const prov = $('#tpProv').value, label = $('#tpLabel').value.trim(), loc = $('#tpLoc').value.trim(), from = TE.parseDate($('#tpFrom').value);
+  const start = TE.parseTime($('#tpStart').value), end = TE.parseTime($('#tpEnd').value), step = +$('#tpStep').value || 30;
+  if (!label) throw new Error('Give the template a label.'); if (start == null || end == null || end <= start) throw new Error('Check the start and end times.');
+  const src = $('#tpCopy').value === '' ? null : S.data.templates[+$('#tpCopy').value];
+  const times = []; for (let m = start; m < end; m += step) times.push(m);
+  const cells = [[], [prov || label], ['Effective From:', from ?? '', '', 'Effective To:', ''], ['Location:', loc, 'Weekly Clinic Template', '', 'Last Modified:', TE.todaySerial()], ['Provider:', label, label, label, label, label], ['Time', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']];
+  for (const m of times){ const row = [m / 1440]; for (let d = 1; d <= 5; d++){ const s = src && src.slots.find(x => x.dow === d && x.min === m); row.push(s ? s.type : ''); } cells.push(row); }
+  cells[3][8] = 'Event Types'; cells[3][9] = 'Slots'; cells[3][10] = 'Hours'; ['M', 'T', 'W', 'TH', 'F'].forEach((x, i) => { cells[3][11 + i] = x; });
+  const base = `TPL ${label} ${from != null ? TE.iso(from) : ''}`.replace(/[\\/?*\[\]:]/g, '').slice(0, 31).trim();
+  let name = base, n = 2; while (S.data.names.some(x => x.toLowerCase() === name.toLowerCase())) name = (base.slice(0, 28) + ' ' + n++);
+  closeModal(); busy(true, 'Creating the template tab…');
+  await S.store.createTemplate({ sheet: name, cells, times, step });
+  busy(false); toast('ok', `Created “${esc(name)}”. Fill the grid from the dropdowns, then Refresh.`); await reload();
+}
+
+// report tabs: counts only
+async function writeReports(){
+  const R = S.R; if (!R) return;
+  const P = x => x == null ? '' : Math.round(x * 1000) / 1000;
+  const scope = `${TE.mdy(R.from)} – ${TE.mdy(R.to)}; as of ${TE.mdy(R.asOf)}${S.f.loc ? '; ' + S.f.loc : ''}${S.f.prov ? '; ' + S.f.prov : ''}${S.f.sl ? '; ' + S.f.sl : ''}`;
+  busy(true, 'Writing report tabs…');
+  const pf = { numFmt: {} };
+  const provH = ['Provider', 'Credential', 'Has template', 'Clinical slots', 'Filled %', 'Kept use %', 'Template fit %', 'Open slots', 'Slots to admin', 'PTO slots', 'Visits', 'Kept', 'No-show %', 'Cancel %', 'Late cancel %', 'Visits in blocked time', 'Visits outside template hours', 'Double-booked', 'Booked ahead %', 'Scope'];
+  const pr = [...R.byProv].sort((a, b) => b.supply - a.supply).map(p => [p.key, credOf(p.key), R.tByProv.has(p.key) ? 'Yes' : 'No', p.supply, P(p.fill), P(p.util), P(p.fit), p.open, p.admin, p.pto, p.aAll, p.aKept, P(p.nsRate), P(p.cxRate), R.hasLate ? P(p.lcRate) : '', p.inBlocked, p.offTemplate, p.dbl, P(p.futFill), scope]);
+  const t = R.total; pr.push(['All', '', '', t.supply, P(t.fill), P(t.util), P(t.fit), t.open, t.admin, t.pto, t.aAll, t.aKept, P(t.nsRate), P(t.cxRate), R.hasLate ? P(t.lcRate) : '', t.inBlocked, t.offTemplate, t.dbl, P(t.futFill), scope]);
+  const pc = c => Object.fromEntries(c.map(i => [i, '0.0%']));
+  await S.store.writeSheet('TA Summary', [provH].concat(pr), { numFmt: pc([4, 5, 6, 12, 13, 14, 18]) });
+  await S.store.writeSheet('TA Slot Types', [['Slot type', 'Slots', 'Filled %', 'Template fit %', 'Kept as intended', 'Kept, other visit', 'No-show', 'Open', 'To admin', 'PTO', 'Booked ahead %', 'Most common other visits']].concat(R.byType.filter(r => r.supply || r.futSupply).sort((a, b) => b.supply - a.supply).map(r => [r.key, r.supply, P(r.fill), P(r.fit), r.keptFit, r.keptOff, r.ns, r.open, r.admin, r.pto, P(r.futFill), Object.entries(R.offMix[r.key] || {}).sort((a, b) => b[1] - a[1]).slice(0, 3).map(x => `${x[0]} (${x[1]})`).join(', ')])), { numFmt: pc([2, 3, 10]) });
+  const vr = (dim, rows) => rows.filter(r => r.aAll).sort((a, b) => b.aAll - a.aAll).map(r => [dim, r.key, r.aAll, r.aKept, r.aNS, r.aCx, P(r.nsRate), P(r.cxRate), R.hasLate ? P(r.lcRate) : '', r.leadMed == null ? '' : r.leadMed]);
+  await S.store.writeSheet('TA Visit Types', [['Group', 'Value', 'Visits', 'Kept', 'No-show', 'Cancelled', 'No-show %', 'Cancel %', 'Late cancel %', 'Median lead days']].concat(vr('Service line', R.bySL), vr('Event class', R.byClass), vr('Event', R.byEvent), vr('Day', R.byDow), vr('Hour', R.byHour.filter(h => typeof h.key === 'number').map(h => Object.assign({}, h, { key: TE.hourLabel(h.key) })))), { numFmt: pc([6, 7, 8]) });
+  await S.store.writeSheet('TA Weekly', [['Week of (Sun)', 'Clinical slots', 'Filled %', 'Template fit %', 'Visits', 'Kept', 'No-show %', 'Cancel %', 'Late cancel %', 'Visits outside template', 'Future template slots', 'Booked ahead %']].concat(R.byWeek.map(w => [w.key, w.supply, P(w.fill), P(w.fit), w.aAll, w.aKept, P(w.nsRate), P(w.cxRate), R.hasLate ? P(w.lcRate) : '', w.inBlocked + w.offTemplate, w.futSupply, P(w.futFill)])), { numFmt: Object.assign({ 0: 'm/d/yyyy' }, pc([2, 3, 6, 7, 8, 11])) });
+  const hours = [...new Set(R.heat.map(h => +String(h.key).split('|')[1]))].sort((a, b) => a - b); const H = new Map(R.heat.map(h => [h.key, h]));
+  await S.store.writeSheet('TA Heatmap', [['Filled % by day and hour'].concat(hours.map(TE.hourLabel))].concat([1, 2, 3, 4, 5].map(d => [TE.DAYS[d]].concat(hours.map(h => { const c = H.get(d + '|' + h); return c && c.supply ? P(c.fill) : ''; })))), { numFmt: Object.fromEntries(hours.map((h, i) => [i + 1, '0%'])) });
+  await S.store.writeSheet('TA 3NA', [['As of', 'Provider', 'Slot type', 'Next available (days)', '3NA (days)', 'Open slots ahead', 'Third open slot']].concat(R.threeNa.map(x => [R.asOf, x.prov, x.type, x.next ?? '', x.third ?? '', x.open, x.thirdDate ?? ''])), { numFmt: { 0: 'm/d/yyyy', 6: 'm/d/yyyy' } });
+  await S.store.writeSheet('TA Exceptions', [['Date', 'Time', 'Provider', 'Event', 'Status', 'Why', 'Minutes outside template']].concat(R.exceptions.map(e => [e.date, TE.hhmm(e.time), e.prov, e.event, e.status, e.why, e.min])), { numFmt: { 0: 'm/d/yyyy' } });
+  busy(false); toast('ok', 'Wrote TA Summary, TA Slot Types, TA Visit Types, TA Weekly, TA Heatmap, TA 3NA and TA Exceptions.');
+}
+async function saveSnapshot(){
+  const R = S.R; if (!R) return;
+  const keep = (S.data.hist || []).filter(h => h.date !== R.asOf);
+  const rows = keep.map(h => [h.date, h.prov, h.type, h.next ?? '', h.third ?? '', h.open]).concat(R.threeNa.map(x => [R.asOf, x.prov, x.type, x.next ?? '', x.third ?? '', x.open]));
+  rows.sort((a, b) => a[0] - b[0] || String(a[1]).localeCompare(String(b[1])) || String(a[2]).localeCompare(String(b[2])));
+  busy(true, 'Saving the 3NA snapshot…');
+  await S.store.writeSheet(SHEETS.hist, [['Snapshot date', 'Provider', 'Slot type', 'Next available (days)', '3NA (days)', 'Open slots ahead']].concat(rows), { numFmt: { 0: 'm/d/yyyy' } });
+  busy(false); toast('ok', `Saved 3NA as of ${TE.mdy(R.asOf)}${S.f.prov || S.f.loc ? ' (with the current filters)' : ''}.`); await reload();
+}
+
+// ---------- install page outside Excel ----------
+function notInExcelHTML(){
+  return `<main style="max-width:640px"><div class="card"><h2><span class="brand"><span class="dot">CT</span></span> Clinic Template Tool</h2>
+    <p>This page is an Excel add-in. It measures provider templates against the NextGen appointment list inside a template workbook.</p>
+    <ol><li>Click <b>Download manifest</b>.</li><li>Open the workbook in Excel on the web → <b>Home → Add-ins → More Add-ins → My Add-ins → Upload My Add-in</b>, and choose the file.</li><li>A <b>Template Tool</b> button appears on the Home tab.</li></ol>
+    <button class="btn primary" data-act="dlManifest">Download manifest</button>
+    <div class="small muted" style="margin-top:10px">Data stays in the workbook. This site only serves the app’s code.</div></div></main>`;
+}
+async function downloadManifest(){
+  const base = location.href.replace(/[?#].*$/, '').replace(/[^/]*$/, '').replace(/\/$/, ''); const host = new URL(base).origin;
+  const x = (await (await fetch('manifest.xml', { cache: 'no-store' })).text()).replaceAll('__BASE__', base).replaceAll('__HOST__', host);
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([x], { type: 'application/xml' })); a.download = 'clinic-template-tool-manifest.xml'; a.click();
+}
+
+(function boot(){
+  S.mode = /[?&]mode=dialog\b/.test(location.search) ? 'dialog' : 'pane';
+  if (window.__TEST_STORE__){ S.store = window.__TEST_STORE__; S.canFull = true; reload(); return; }   // headless tests
+  if (typeof Office === 'undefined'){ $('#app').innerHTML = notInExcelHTML(); return; }
+  let settled = false;
+  Office.onReady(info => {
+    settled = true;
+    if (S.mode === 'dialog'){ S.store = RemoteStore(); reload(); return; }   // the dialog has no Excel host of its own
+    if (info.host !== Office.HostType.Excel){ $('#app').innerHTML = notInExcelHTML(); return; }
+    try { S.canFull = Office.context.requirements.isSetSupported('DialogApi', '1.2'); } catch { S.canFull = false; }
+    S.store = OfficeStore(); reload();
+  });
+  setTimeout(() => { if (!settled) $('#app').innerHTML = notInExcelHTML(); }, 4000);
+})();
