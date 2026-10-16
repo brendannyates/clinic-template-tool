@@ -9,7 +9,7 @@ Excel add-in for Practice Managers. Put copies of provider templates in a workbo
 
 | Tab | What it holds |
 |---|---|
-| Template tabs (any name) | One weekly grid per provider in the provider-configurable layout: `Provider:`, `Location:`, `Effective From:` labels, a `Time` column, Monday–Friday headers, a slot type in each cell. Several grids can share a tab. **Setup → New template tab** makes one; copy an old one to record a revision. |
+| Template tabs (any name) | One weekly grid per provider in the provider-configurable layout: `Provider:`, `Location:`, `Effective From:` labels, a `Time` column, Monday–Friday headers, a slot type in each cell. Several grids can share a tab. **Setup → New template tab** makes one; copy an old one to record a revision. A copy duplicates that tab, so its colors, dropdowns and formulas come along. |
 | Appointment List | The NextGen *Appointments Listing* report. **Setup → Import NextGen report** writes it. |
 | Slot Types | Slot type → Clinical or Blocked, and what it accepts (event class, service line or event; `,` = any of, `+` = all of, `*` = anything). |
 | Ref | NextGen event → event class, service line, whether it counts (holds and reference rows don't). |

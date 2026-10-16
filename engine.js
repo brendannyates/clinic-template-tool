@@ -98,26 +98,64 @@
         const step = steps.length ? steps.sort((a, b) => a - b)[Math.floor(steps.length / 2)] : 30;
         times.forEach((x, i) => { cols.forEach(col => { const v = txt(cell(x.r, col.c)); if (v) slots.push({ dow: col.d, min: x.t, len: step, type: v, addr: [x.r, col.c] }); }); });
         // header labels
-        const hdr = {}; let title = '';
+        const hdr = {}, at = {}; let title = '', top = r;    // at: [row, col] of each label's value cell, so a copy can rewrite it
         for (let hr = Math.max(0, r - 5); hr <= r; hr++){
           for (let hc = Math.max(0, tc - 1); hc <= tc + cols.length + 2; hc++){
             const v = txt(cell(hr, hc)); if (!v) continue;
             for (const [k, re] of Object.entries(LABELS)) if (re.test(v) && hdr[k] == null){
-              for (let j = hc + 1; j <= hc + 8; j++){ const w = cell(hr, j); if (w !== '' && w != null && !Object.values(LABELS).some(q => q.test(txt(w)))){ hdr[k] = w; break; } }
-              if (hdr[k] == null) hdr[k] = '';
+              for (let j = hc + 1; j <= hc + 8; j++){ const w = cell(hr, j); if (w !== '' && w != null && !Object.values(LABELS).some(q => q.test(txt(w)))){ hdr[k] = w; at[k] = [hr, j]; break; } }
+              if (hdr[k] == null){ hdr[k] = ''; at[k] = [hr, hc + 1]; }
+              top = Math.min(top, hr);
             }
           }
         }
-        for (let hr = Math.max(0, r - 6); hr < r && !title; hr++){ const v = txt(cell(hr, tc)) || txt(cell(hr, tc + 1)); if (v && /[a-z]{2,}/i.test(v) && !Object.values(LABELS).some(q => q.test(v)) && nameTokens(v).length && !/template|schedule/i.test(v)) title = v; }
+        for (let hr = Math.max(0, r - 6); hr < r && !title; hr++){ const v = txt(cell(hr, tc)) || txt(cell(hr, tc + 1)); if (v && /[a-z]{2,}/i.test(v) && !Object.values(LABELS).some(q => q.test(v)) && nameTokens(v).length && !/template|schedule/i.test(v)){ title = v; at.title = [hr, txt(cell(hr, tc)) ? tc : tc + 1]; top = Math.min(top, hr); } }
         const label = txt(hdr.provider) || title;
         out.push({
-          sheet, anchor: [r, c], label, title, location: txt(hdr.location),
+          sheet, anchor: [r, c], label, title, location: txt(hdr.location), at, top, bottom: times[times.length - 1].r, timeCol: tc, dayCols: cols.map(x => x.c),
           modified: parseDate(hdr.modified), effFrom: parseDate(hdr.from), effTo: parseDate(hdr.to),
           step, start: times[0].t, end: times[times.length - 1].t + step, days: [...new Set(slots.map(s => s.dow))].sort(), slots,
         });
       }
     }
     return out;
+  }
+
+  // Plan for copying one grid onto a new tab with the source tab's formatting: the tab is duplicated, header values
+  // rewritten, and the other grids' row bands deleted. t = the grid, sibs = every grid on its tab, values = the tab.
+  // o: { label, title, location, from, today, empty }. Coordinates are 0-based on the source tab.
+  function copyPlan(t, sibs, values, o){
+    const cell = (r, c) => txt(values[r] && values[r][c]);
+    const list = sibs.slice().sort((a, b) => a.top - b.top);
+    const starts = list.map((g, k) => k === 0 ? 0 : (g.top - 1 > list[k - 1].bottom ? g.top - 1 : g.top));
+    const bands = list.map((g, k) => ({ g, r0: starts[k], r1: k < list.length - 1 ? starts[k + 1] - 1 : Math.max(values.length - 1, g.bottom) }));
+    const mine = bands.find(b => b.g === t);
+    const others = bands.filter(b => b.g !== t);
+    if (others.some(b => b.g.top <= t.bottom && t.top <= b.g.bottom)) return { error: `Another grid sits beside ${t.label || 'this one'} on “${t.sheet}”. Move it to its own rows, then copy.` };
+    const writes = [];
+    const lastDay = t.dayCols[t.dayCols.length - 1];
+    if (t.at.from) writes.push([t.at.from[0], t.at.from[1], o.from ?? '', 'm/d/yyyy']);
+    else {
+      // no Effective From label: add one on a spare row above the labels, else to the right of them
+      const spare = t.top - 1 >= mine.r0 && t.top - 1 >= t.anchor[0] - 5 && !cell(t.top - 1, t.timeCol) && !cell(t.top - 1, t.timeCol + 1) ? [t.top - 1, t.timeCol] : null;
+      const row = t.at.location ? t.at.location[0] : t.top;
+      let side = null; for (let c = lastDay + 1; c <= t.timeCol + t.dayCols.length + 2 && !side; c++) if (!cell(row, c) && !cell(row, c + 1)) side = [row, c];
+      const p = spare || side; if (!p) return { error: `Add an “Effective From:” label above ${t.label || 'the grid'} on “${t.sheet}”, then copy.` };
+      writes.push([p[0], p[1], 'Effective From:'], [p[0], p[1] + 1, o.from ?? '', 'm/d/yyyy']);
+    }
+    if (t.at.to && cell(...t.at.to)) writes.push([t.at.to[0], t.at.to[1], '']);
+    if (t.at.provider){
+      const [pr, pc] = t.at.provider; writes.push([pr, pc, o.label]);
+      (values[pr] || []).forEach((v, c) => { if (c !== pc && t.label && txt(v) === t.label) writes.push([pr, c, o.label]); });   // labels repeated across the day columns
+    }
+    if (t.at.title && o.title) writes.push([t.at.title[0], t.at.title[1], o.title]);
+    if (t.at.location && o.location) writes.push([t.at.location[0], t.at.location[1], o.location]);
+    if (t.at.modified) writes.push([t.at.modified[0], t.at.modified[1], o.today, 'm/d/yyyy']);
+    const first = t.anchor[0] + 1;
+    const slots = [first, t.dayCols[0], t.bottom - first + 1, t.dayCols.length];
+    const above = others.filter(b => b.r1 < first).reduce((n, b) => n + b.r1 - b.r0 + 1, 0);
+    return { writes, clearSlots: !!o.empty, slots, slotsAfter: [first - above, slots[1], slots[2], slots[3]],
+      deleteRows: others.map(b => [b.r0, b.r1]).sort((a, b) => b[0] - a[0]) };
   }
 
   // ---------- reference tables ----------
@@ -181,7 +219,7 @@
     date: /^(appt\.?\s*)?date$|^appointment date$/i, time: /^(start\s*)?time$|^appt\.?\s*time$|^start$/i, end: /^end\s*(tm|time)?$/i,
     dur: /^duration|^length|^mins?$/i, prov: /^(provider|resource|rendering|rendering provider|resource name)$/i, event: /^(event|appt\.?\s*type|appointment type|event name|type)$/i,
     status: /^(status|appt\.?\s*status|sts)$/i, loc: /^(location|site|clinic|loc)$/i,
-    booked: /^(created|create(d)?\s*(date|on|dt)|date\s*created|scheduled\s*(on|date)|date\s*scheduled|booked(\s*(on|date))?|appt\.?\s*made|made\s*on|entered(\s*(on|date))?|entry\s*date|create\s*timestamp)$/i,
+    booked: /^(created|create(d)?\s*(date|on|dt)|crt\.?\s*(dt|date)|date\s*created|scheduled\s*(on|date)|date\s*scheduled|booked(\s*(on|date))?|appt\.?\s*made|made\s*on|entered(\s*(on|date))?|entry\s*date|create\s*timestamp)$/i,
     bookedTime: /^(create(d)?\s*time|scheduled\s*time|booked\s*time|entry\s*time)$/i,
     cancel: /^(cancel(l)?(ed)?\s*(date|on|dt|date\/time|timestamp)?|date\s*cancel(l)?(ed)?|cxl\s*(date|dt))$/i,
     cancelTime: /^(cancel(l)?(ed)?\s*time|cxl\s*time)$/i,
@@ -227,7 +265,7 @@
 
   // ---------- analysis ----------
   const ACTIVE = new Set(['Kept', 'No Show', 'Expected']);
-  function blankAcc(){ return { supply: 0, kept: 0, keptFit: 0, keptOff: 0, ns: 0, open: 0, admin: 0, pto: 0, futSupply: 0, futBooked: 0, aKept: 0, aNS: 0, aCx: 0, aLC: 0, aCxKnown: 0, aExp: 0, aAll: 0, inBlocked: 0, offTemplate: 0, dbl: 0, overMin: 0, lead: [] }; }
+  function blankAcc(){ return { supply: 0, kept: 0, keptFit: 0, keptOff: 0, ns: 0, open: 0, admin: 0, pto: 0, unres: 0, futSupply: 0, futBooked: 0, aKept: 0, aNS: 0, aCx: 0, aLC: 0, aCxKnown: 0, aExp: 0, aAll: 0, inBlocked: 0, offTemplate: 0, dbl: 0, overMin: 0, lead: [] }; }
   function rates(a){
     const d = (n, m) => m ? n / m : null;
     return { ...a, fill: d(a.kept + a.ns, a.supply), util: d(a.kept, a.supply), fit: d(a.keptFit, a.kept), nsRate: d(a.aNS, a.aKept + a.aNS), cxRate: d(a.aCx, a.aKept + a.aNS + a.aCx), lcRate: a.aCxKnown ? d(a.aLC, a.aKept + a.aNS + a.aCx) : null,
@@ -268,6 +306,7 @@
     const appts = [];
     for (const a of allAppts){
       if (!a.prov || !people.includes(a.prov)) continue;                 // providers only, no chairs or rooms
+      if (!keep(a)) continue;                                            // provider and location filters apply to visits too
       const c = clsOf(a); if (!c.mapped) unmapped.set(a.event, (unmapped.get(a.event) || 0) + 1);
       if (c.kind === 'ignore') continue;
       const x = Object.assign({}, a, { kind: c.kind, cls: c.cls, sl: c.sl, pto: !!c.pto });
@@ -335,6 +374,7 @@
       for (const [dim, key] of Object.entries(dims)){
         if (past && inWin(s.date)) bump(dim, key, a => {
           if (s.out === 'pto'){ a.pto++; return; }
+          if (s.out === 'unresolved'){ a.unres++; return; }   // still Expected (e.g. later today): outcome unknown, so it stays out of fill
           a.supply++;
           if (s.out === 'keptFit'){ a.kept++; a.keptFit++; } else if (s.out === 'keptOff'){ a.kept++; a.keptOff++; } else if (s.out === 'ns') a.ns++; else if (s.out === 'admin') a.admin++; else if (s.out === 'open') a.open++;
         });
@@ -455,6 +495,6 @@
   ];
 
   return { DAYS, dow, weekStart, iso, mdy, hhmm, hourLabel, parseTime, parseDate, parseDateTime, serialFromYMD, todaySerial,
-    nameTokens, isPersonResource, credentialOf, matchProvider, lastName, parseTemplates, buildRef, classify, buildSlotTypes, slotTypeOf, accepts,
+    nameTokens, isPersonResource, credentialOf, matchProvider, lastName, parseTemplates, copyPlan, buildRef, classify, buildSlotTypes, slotTypeOf, accepts,
     findHeader, parseAppts, analyze, readAccessModel, guessServiceLine, DEFAULT_SLOT_TYPES };
 });

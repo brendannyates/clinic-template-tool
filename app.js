@@ -56,8 +56,11 @@ function OfficeStore(){
     }),
     // replace a sheet's contents (report and config tabs)
     writeSheet: (name, aoa, fmt = {}) => Excel.run(async ctx => {
-      const { ws } = await sheetFor(ctx, name); ws.getRange().clear(); await ctx.sync();
+      const { ws, fresh } = await sheetFor(ctx, name);
+      const keep = fmt.keepFormat && !fresh;     // lookup tabs a PM may have colored: replace values only
+      ws.getRange().clear(keep ? 'Contents' : undefined); await ctx.sync();
       const w = await writeRows(ctx, ws, aoa);
+      if (keep){ await ctx.sync(); return; }
       const hdr = ws.getRangeByIndexes(0, 0, 1, w); hdr.format.font.bold = true; hdr.format.fill.color = '#DCEFED';
       for (const [c, f] of Object.entries(fmt.numFmt || {})) if (aoa.length > 1) ws.getRangeByIndexes(1, +c, aoa.length - 1, 1).numberFormat = Array.from({ length: aoa.length - 1 }, () => [f]);
       ws.freezePanes.freezeRows(1);
@@ -91,6 +94,21 @@ function OfficeStore(){
       try { g.dataValidation.rule = { list: { inCellDropDown: true, source: `='${SHEETS.st}'!$A$2:$A$300` } }; g.dataValidation.errorAlert = { showAlert: false }; } catch {}
       ws.activate(); await ctx.sync();
     }),
+    // duplicate a PM's own template tab so its colors, conditional formats, dropdowns, merges and formulas carry over,
+    // then drop the other grids on it. Writes use the source tab's coordinates; rows are deleted last, bottom up.
+    copyTemplate: spec => Excel.run(async ctx => {
+      const ws = ctx.workbook.worksheets.getItem(spec.src).copy('End'); ws.name = spec.sheet; await ctx.sync();
+      for (const [r, c, v, f] of spec.writes){ const g = ws.getRangeByIndexes(r, c, 1, 1); g.values = [[v]]; if (f) g.numberFormat = [[f]]; }
+      if (spec.clearSlots) ws.getRangeByIndexes(...spec.slots).clear('Contents');
+      await ctx.sync();
+      for (const [r0, r1] of spec.deleteRows) ws.getRange(`${r0 + 1}:${r1 + 1}`).delete('Up');
+      await ctx.sync();
+      // a dropdown that pointed at another grid's list now reads #REF; point it at the Slot Types list instead
+      const sl = ws.getRangeByIndexes(...spec.slotsAfter); sl.dataValidation.load('rule'); await ctx.sync();
+      const list = sl.dataValidation.rule && sl.dataValidation.rule.list;
+      if (!list || /#REF/i.test(String(list.source))){ try { sl.dataValidation.clear(); sl.dataValidation.rule = { list: { inCellDropDown: true, source: spec.dvSource } }; sl.dataValidation.errorAlert = { showAlert: false }; } catch {} }
+      ws.activate(); ws.getRangeByIndexes(spec.slotsAfter[0], spec.slotsAfter[1], 1, 1).select(); await ctx.sync();
+    }),
     getDoc: k => { try { return settings().get(k); } catch { return null; } },
     setDoc: (k, v) => new Promise(res => { try { settings().set(k, v); settings().saveAsync(() => res()); } catch { res(); } }),
   };
@@ -100,7 +118,7 @@ function OfficeStore(){
 const CH = 12000;
 function sendChunks(fn, obj){ const s = JSON.stringify(obj); const id = Math.random().toString(36).slice(2); const n = Math.max(1, Math.ceil(s.length / CH)); for (let i = 0; i < n; i++) fn(JSON.stringify({ c: id, i, n, d: s.slice(i * CH, (i + 1) * CH) })); }
 function makeRx(handler){ const buf = {}; return str => { let m; try { m = JSON.parse(str); } catch { return; } if (!m || !m.c) return; const b = buf[m.c] || (buf[m.c] = []); b[m.i] = m.d; if (b.filter(x => x != null).length === m.n){ delete buf[m.c]; try { handler(JSON.parse(b.join(''))); } catch (e){ console.error(e); } } }; }
-const RELAY_OPS = ['load', 'writeSheet', 'replaceAppts', 'createTemplate', 'setDoc'];
+const RELAY_OPS = ['load', 'writeSheet', 'replaceAppts', 'createTemplate', 'copyTemplate', 'setDoc'];
 function RemoteStore(){
   const pend = new Map(); let docs = {};
   const rx = makeRx(m => { if (m.rid && pend.has(m.rid)){ const p = pend.get(m.rid); pend.delete(m.rid); m.ok ? p.res(m.res) : p.rej(new Error(m.err)); } });
@@ -110,7 +128,7 @@ function RemoteStore(){
   return {
     live: true, remote: true,
     async load(){ const d = await call('load'); docs = d.docs || {}; return d; },
-    writeSheet: (...a) => call('writeSheet', a), replaceAppts: (...a) => call('replaceAppts', a), createTemplate: (...a) => call('createTemplate', a),
+    writeSheet: (...a) => call('writeSheet', a), replaceAppts: (...a) => call('replaceAppts', a), createTemplate: (...a) => call('createTemplate', a), copyTemplate: (...a) => call('copyTemplate', a),
     getDoc: k => docs[k] ?? null, async setDoc(k, v){ docs[k] = v; await call('setDoc', [k, v]); },
     close(){ up({ ev: 'close' }); },
   };
@@ -158,7 +176,7 @@ function prepare(raw){
   const ap = raw.appt ? TE.parseAppts(raw.appt.values) : null;
   if (ap && raw.appt) ap.sheet = raw.appt.sheet;
   return {
-    names: raw.names || [], hidden: raw.hidden || [], templates, ap,
+    names: raw.names || [], hidden: raw.hidden || [], grids: raw.grids || {}, templates, ap,
     ref: cfgRows(raw.cfg.ref, SPEC.ref), refExists: !!raw.cfg.ref,
     st: cfgRows(raw.cfg.st, SPEC.st), stExists: !!raw.cfg.st,
     prov: cfgRows(raw.cfg.prov, SPEC.prov).map(p => ({ name: String(p.name || '').trim(), label: String(p.label || '').trim(), cred: String(p.cred || '').trim(), include: p.include })), provExists: !!raw.cfg.prov,
@@ -493,7 +511,7 @@ async function writeSlotTypes(){
   const base = S.data.stExists ? S.data.st.map(r => [r.type, r.kind, r.accepts, r.notes || '']) : TE.DEFAULT_SLOT_TYPES.map(r => r.slice());
   const inBase = new Set(base.map(r => String(r[0]).toLowerCase()));
   for (const t of S.data.templates) for (const s of t.slots){ const k = s.type.toLowerCase(); if (!inBase.has(k)){ inBase.add(k); const g = TE.slotTypeOf(new Map(), s.type); base.push([s.type, g.kind === 'blocked' ? 'Blocked' : 'Clinical', g.any ? '*' : '', 'Added from a template; fill in Accepts']); } }
-  busy(true, 'Writing Slot Types…'); await S.store.writeSheet(SHEETS.st, [['Slot type', 'Kind', 'Accepts', 'Notes']].concat(base)); busy(false);
+  busy(true, 'Writing Slot Types…'); await S.store.writeSheet(SHEETS.st, [['Slot type', 'Kind', 'Accepts', 'Notes']].concat(base), { keepFormat: true }); busy(false);
   toast('ok', `${SHEETS.st} tab has ${base.length} slot types.`); await reload();
 }
 async function writeRef(){
@@ -502,7 +520,7 @@ async function writeRef(){
   const events = S.data.ap && !S.data.ap.error ? [...new Set(S.data.ap.rows.map(a => a.event).filter(Boolean))] : [];
   let added = 0;
   for (const ev of events.sort()) if (!seen.has(ev.toLowerCase())){ const g = TE.classify(new Map(), ev); rows.push([ev, 'Provider', g.kind === 'ignore' ? 'Reference/Hold Only' : g.kind === 'nonpt' ? 'Admin' : 'Clinical', g.cls, g.sl, g.kind === 'ignore' ? 'No' : 'Always']); added++; }
-  busy(true, 'Writing Ref…'); await S.store.writeSheet(SHEETS.ref, [['Event', 'Resource Type', 'Schedule Classification', 'Event Class', 'Service Line', 'Template Eligible']].concat(rows)); busy(false);
+  busy(true, 'Writing Ref…'); await S.store.writeSheet(SHEETS.ref, [['Event', 'Resource Type', 'Schedule Classification', 'Event Class', 'Service Line', 'Template Eligible']].concat(rows), { keepFormat: true }); busy(false);
   toast('ok', added ? `Added ${added} events to ${SHEETS.ref}. Check their Event Class and Service Line.` : `${SHEETS.ref} already lists every event.`); await reload();
 }
 async function writeProviders(){
@@ -510,7 +528,7 @@ async function writeProviders(){
   const seen = new Set(rows.map(r => r[0]));
   const names = S.data.ap && !S.data.ap.error ? [...new Set(S.data.ap.rows.map(a => a.prov).filter(Boolean))].sort() : [];
   for (const n of names) if (!seen.has(n)){ const t = R && R.templates.find(x => x.provider === n); rows.push([n, t ? t.label : '', TE.credentialOf(n), TE.isPersonResource(n) ? '' : 'No']); }
-  busy(true, 'Writing Providers…'); await S.store.writeSheet(SHEETS.prov, [['NextGen provider', 'Template label', 'Credential', 'Include']].concat(rows)); busy(false);
+  busy(true, 'Writing Providers…'); await S.store.writeSheet(SHEETS.prov, [['NextGen provider', 'Template label', 'Credential', 'Include']].concat(rows), { keepFormat: true }); busy(false);
   toast('ok', `${SHEETS.prov} tab has ${rows.length} rows.`); await reload();
 }
 
@@ -523,25 +541,37 @@ function newTemplateDialog(){
     <div class="fld">Location<input id="tpLoc"></div>
     <div class="fld">Effective from<input id="tpFrom" type="date" value="${TE.iso(TE.todaySerial())}"></div>
     <div class="row"><div class="fld" style="flex:1">Day starts<input id="tpStart" type="time" value="08:00"></div><div class="fld" style="flex:1">Day ends<input id="tpEnd" type="time" value="18:00"></div><div class="fld" style="flex:1">Slot length (min)<input id="tpStep" type="number" value="30" min="5" max="120"></div></div>
-    <div class="fld">Start from<select id="tpCopy" data-act="tplCopy"><option value="">A blank grid</option>${S.data.templates.map((t, i) => `<option value="${i}">${esc(t.sheet)} · ${esc(t.label)}</option>`).join('')}</select></div>
-    <div class="small muted">Copying an existing template is how you record a revision: give the copy a new Effective From date and edit it. The old tab keeps measuring the weeks before.</div>
+    <div class="fld">Start from<select id="tpCopy" data-act="tplCopy"><option value="">A blank grid</option>${S.data.templates.map((t, i) => `<option value="${i}">Copy ${esc(t.sheet)} · ${esc(t.label)}</option><option value="${i}:e">${esc(t.sheet)} · ${esc(t.label)} layout, empty grid</option>`).join('')}</select></div>
+    <div class="small muted">Copying an existing template is how you record a revision: give the copy a new Effective From date and edit it. The old tab keeps measuring the weeks before. A copy keeps that tab’s colors, dropdowns and formulas, and its times; the start, end and slot length above only apply to a blank grid.</div>
     <div class="row" style="margin-top:12px"><button class="btn primary" data-act="makeTemplate">Create tab</button><button class="btn" data-act="close">Cancel</button></div>`);
   const sync = () => { const p = $('#tpProv').value; $('#tpLabel').value = p ? (TE.lastName(p).replace(/^./, c => c.toUpperCase())) : ''; const locs = {}; (S.data.ap.rows || []).filter(a => a.prov === p && a.loc).forEach(a => { locs[a.loc] = (locs[a.loc] || 0) + 1; }); $('#tpLoc').value = Object.entries(locs).sort((a, b) => b[1] - a[1]).map(x => x[0])[0] || ''; };
   $('#tpProv').addEventListener('change', sync); sync();
 }
-function fillTemplateDefaults(){ const i = $('#tpCopy').value; if (i === '') return; const t = S.data.templates[+i]; $('#tpStart').value = hm(t.start); $('#tpEnd').value = hm(t.end); $('#tpStep').value = t.step; if (t.location) $('#tpLoc').value = t.location; }
+function fillTemplateDefaults(){ const i = $('#tpCopy').value; if (i === '') return; const t = S.data.templates[parseInt(i, 10)]; $('#tpStart').value = hm(t.start); $('#tpEnd').value = hm(t.end); $('#tpStep').value = t.step; if (t.location) $('#tpLoc').value = t.location; }
 const hm = m => String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0');
 async function makeTemplate(){
   const prov = $('#tpProv').value, label = $('#tpLabel').value.trim(), loc = $('#tpLoc').value.trim(), from = TE.parseDate($('#tpFrom').value);
   const start = TE.parseTime($('#tpStart').value), end = TE.parseTime($('#tpEnd').value), step = +$('#tpStep').value || 30;
   if (!label) throw new Error('Give the template a label.'); if (start == null || end == null || end <= start) throw new Error('Check the start and end times.');
-  const src = $('#tpCopy').value === '' ? null : S.data.templates[+$('#tpCopy').value];
+  const pick = $('#tpCopy').value; const src = pick === '' ? null : S.data.templates[parseInt(pick, 10)];
+  const sheetName = base => { let name = base, n = 2; while (S.data.names.some(x => x.toLowerCase() === name.toLowerCase())) name = (base.slice(0, 28) + ' ' + n++); return name; };
+  if (src && S.data.grids[src.sheet]){
+    // copy the PM's own tab so its colors, dropdowns and formulas come along
+    const sibs = S.data.templates.filter(t => t.sheet === src.sheet);
+    const plan = TE.copyPlan(src, sibs, S.data.grids[src.sheet], { label, title: src.title && src.at.title ? (prov || label) : '', location: loc, from, today: TE.todaySerial(), empty: pick.endsWith(':e') });
+    if (plan.error) throw new Error(plan.error);
+    const name = sheetName(`TPL ${label} ${from != null ? TE.iso(from) : ''}`.replace(/[\\/?*\[\]:]/g, '').slice(0, 31).trim());
+    closeModal(); busy(true, 'Copying the template tab…');
+    await S.store.copyTemplate(Object.assign(plan, { src: src.sheet, sheet: name, dvSource: `='${SHEETS.st}'!$A$2:$A$300` }));
+    busy(false); toast('ok', `Created “${esc(name)}” from “${esc(src.sheet)}” with its formatting. ${plan.clearSlots ? 'Fill the grid' : 'Edit the slots'}, then Refresh.`); await reload();
+    return;
+  }
   const times = []; for (let m = start; m < end; m += step) times.push(m);
   const cells = [[], [prov || label], ['Effective From:', from ?? '', '', 'Effective To:', ''], ['Location:', loc, 'Weekly Clinic Template', '', 'Last Modified:', TE.todaySerial()], ['Provider:', label, label, label, label, label], ['Time', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']];
   for (const m of times){ const row = [m / 1440]; for (let d = 1; d <= 5; d++){ const s = src && src.slots.find(x => x.dow === d && x.min === m); row.push(s ? s.type : ''); } cells.push(row); }
   cells[3][8] = 'Event Types'; cells[3][9] = 'Slots'; cells[3][10] = 'Hours'; ['M', 'T', 'W', 'TH', 'F'].forEach((x, i) => { cells[3][11 + i] = x; });
   const base = `TPL ${label} ${from != null ? TE.iso(from) : ''}`.replace(/[\\/?*\[\]:]/g, '').slice(0, 31).trim();
-  let name = base, n = 2; while (S.data.names.some(x => x.toLowerCase() === name.toLowerCase())) name = (base.slice(0, 28) + ' ' + n++);
+  const name = sheetName(base);
   closeModal(); busy(true, 'Creating the template tab…');
   await S.store.createTemplate({ sheet: name, cells, times, step });
   busy(false); toast('ok', `Created “${esc(name)}”. Fill the grid from the dropdowns, then Refresh.`); await reload();

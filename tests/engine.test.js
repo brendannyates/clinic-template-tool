@@ -164,3 +164,67 @@ test('appointment list header, run date and status words', () => {
   assert.ok(Math.abs(r.rows[1].cancelAt - (MON + t(16))) < 1e-9);
   assert.equal(r.rows[0].booked, D(2026, 2, 20));
 });
+
+test('provider and location filters apply to visit rates, not just slots', () => {
+  const Q = 'Okafor PMHNP, Jordan';
+  const appts = [
+    ap(MON, 9, 0, 'TMS Consult In Person', 'Kept'),
+    ap(MON + 1, 9, 0, 'Med Management Telepsych', 'No Show'),
+    ap(MON, 9, 0, 'Med Management Telepsych', 'No Show', { prov: Q, loc: 'Westside' }),
+    ap(MON, 10, 0, 'Med Management Telepsych', 'No Show', { prov: Q, loc: 'Westside' }),
+    ap(MON + 1, 10, 0, 'Med Management Telepsych', 'Cancelled', { prov: Q, loc: 'Westside' }),
+  ];
+  const all = scenario(appts), p = scenario(appts, { provs: new Set([P]) }), q = scenario(appts, { provs: new Set([Q]) });
+  assert.equal(all.total.aAll, 5);
+  assert.equal(p.total.aAll, 2); assert.equal(p.total.nsRate, 0.5);
+  assert.equal(q.total.aAll, 3); assert.equal(q.total.nsRate, 1); assert.equal(q.total.supply, 0);   // no template for Q
+  assert.equal(scenario(appts, { locs: new Set(['Westside']) }).total.aAll, 3);
+});
+
+test('slots still Expected on the as-of day stay out of fill', () => {
+  const R = scenario([
+    ap(MON + 7, 9, 0, 'TMS Consult In Person', 'Kept'),
+    ap(MON + 7, 10, 0, 'Tel New Patient - Mature', 'Expected'),   // later today
+  ]);
+  const T = R.total;
+  assert.equal(T.unres, 1);
+  assert.equal(T.supply, 1);          // the window is just the as-of Monday: consult + new patient, minus the unresolved one
+  assert.equal(T.fill, 1);
+});
+
+test('NextGen "Crt Dt" is read as the created date', () => {
+  const v = [['Appt Date', 'Time', 'Provider', 'Event', 'Status', 'Duration', 'Location', 'Crt Dt', 'Mod Dt'],
+    [MON, t(9), P, 'TMS Consult In Person', 'Kept', 30, 'Eastside', MON - 10, MON - 2]];
+  const r = TE.parseAppts(v);
+  assert.ok(r.has.booked);
+  assert.equal(r.rows[0].booked, MON - 10);
+});
+
+test('copyPlan keeps one grid from a stacked tab and rewrites its header', () => {
+  const v = grid({ label: 'Jones', withTimeLabel: false }).concat([[], []], grid({ label: 'Lee', from: D(2026, 3, 1) }));
+  const ts = TE.parseTemplates('Stack', v);
+  for (const [i, empty] of [[0, false], [1, false], [1, true]]){
+    const plan = TE.copyPlan(ts[i], ts, v, { label: 'Kim', title: 'Dana Kim, MD', location: 'Northside', from: D(2026, 9, 1), today: D(2026, 8, 1), empty });
+    assert.ok(!plan.error, plan.error);
+    const w = v.map(r => r.slice());
+    for (const [r, c, x] of plan.writes){ while (w[r].length <= c) w[r].push(''); w[r][c] = x; }
+    if (plan.clearSlots){ const [r0, c0, h, n] = plan.slots; for (let r = r0; r < r0 + h; r++) for (let c = c0; c < c0 + n; c++) w[r][c] = ''; }
+    for (const [a, b] of plan.deleteRows) w.splice(a, b - a + 1);
+    const back = TE.parseTemplates('Copy', w);
+    assert.equal(back.length, 1);
+    assert.equal(back[0].label, 'Kim'); assert.equal(back[0].location, 'Northside'); assert.equal(back[0].effFrom, D(2026, 9, 1)); assert.equal(back[0].modified, D(2026, 8, 1));
+    assert.equal(back[0].slots.length, empty ? 0 : 6);
+    assert.equal(back[0].anchor[0] + 1, plan.slotsAfter[0]);
+    assert.ok(w.every(r => !r.includes('Jones') && !r.includes('Lee')), 'the old label is gone from every cell');
+  }
+});
+
+test('copyPlan adds an Effective From label when the grid has none', () => {
+  const v = [[], [], ['', 'Location:', 'Eastside', 'Provider:', 'Smith', 'Last Modified:', D(2026, 2, 1)], ['', 'Time', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'],
+    ['', t(9), 'Telepsych', 'Admin', '', '', ''], ['', t(9, 30), 'Telepsych', '', '', '', 'Telepsych'], ['', t(10)]];
+  const [g] = TE.parseTemplates('Tab', v);
+  const plan = TE.copyPlan(g, [g], v, { label: 'Smith', location: '', from: D(2026, 9, 1), today: D(2026, 8, 1) });
+  const w = v.map(r => r.slice()); for (const [r, c, x] of plan.writes){ while (w[r].length <= c) w[r].push(''); w[r][c] = x; }
+  assert.equal(TE.parseTemplates('Tab', w)[0].effFrom, D(2026, 9, 1));
+  assert.equal(TE.parseTemplates('Tab', w)[0].location, 'Eastside');   // blank location in the dialog leaves it alone
+});
