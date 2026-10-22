@@ -52,6 +52,29 @@
   const hhmm = min => { if (min == null) return ''; const h = Math.floor(min / 60), m = min % 60; return `${((h + 11) % 12) + 1}:${String(m).padStart(2, '0')} ${h < 12 ? 'AM' : 'PM'}`; };
   const hourLabel = h => `${((h + 11) % 12) + 1} ${h < 12 ? 'AM' : 'PM'}`;
 
+  // Business hours (Monday to Friday, dayStart..dayEnd minutes) between two serial date-times.
+  function businessHours(from, to, dayStart = 480, dayEnd = 1080){
+    if (from == null || to == null || to <= from) return 0;
+    let mins = 0;
+    for (let d = Math.floor(from); d <= Math.floor(to); d++){
+      const w = dow(d); if (w === 0 || w === 6) continue;
+      const a = Math.max(d + dayStart / 1440, from), b = Math.min(d + dayEnd / 1440, to);
+      if (b > a) mins += (b - a) * 1440;
+    }
+    return Math.round(mins) / 60;
+  }
+  // The moment that is `hours` business hours before `at` (when a slot enters the release window).
+  function minusBusinessHours(at, hours, dayStart = 480, dayEnd = 1080){
+    let left = hours * 60, t = at;
+    for (let guard = 0; left > 0 && guard < 400; guard++){
+      const d = Math.floor(t - 1e-9); const w = dow(d);
+      const end = Math.min(t, d + dayEnd / 1440), start = d + dayStart / 1440;
+      if (w !== 0 && w !== 6 && end > start){ const avail = Math.round((end - start) * 1440); if (avail >= left) return end - left / 1440; left -= avail; }
+      t = d;
+    }
+    return t;
+  }
+
   // ---------- provider names ----------
   const CRED_WORDS = new Set(['md', 'do', 'np', 'pmhnp', 'bc', 'fnp', 'aprn', 'pa', 'pac', 'dr', 'phd', 'psyd', 'rn', 'mba', 'mph', 'jr', 'sr', 'ii', 'iii']);
   const nameTokens = s => lc(s).replace(/[^a-z\s,'-]/g, ' ').split(/[\s,]+/).map(t => t.replace(/^['-]+|['-]+$/g, '')).filter(t => t.length >= 2 && !CRED_WORDS.has(t));
@@ -67,6 +90,15 @@
     if (hits.length === 1) return hits[0];
     if (hits.length > 1){ const best = hits.map(n => ({ n, s: nameTokens(n).filter(t => toks.includes(t)).length })).sort((a, b) => b.s - a.s); if (best[0].s > best[1].s) return best[0].n; }
     return null;
+  }
+
+  // LASFIR: first 3 letters of the last name + first 3 of the first name. "Smith, John (Tom)" -> SMIJOH.
+  // Same rule as the MHS Confirmations tool: a name not in "Last, First" form gets no code rather than a guess.
+  const letters = s => String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Za-z]/g, '');
+  function lasfir(raw){
+    const s = txt(raw); const i = s.indexOf(','); if (i < 0) return '';
+    const last = letters(s.slice(0, i)), first = letters(s.slice(i + 1).replace(/\([^)]*\)/g, '').trim().split(/\s+/)[0] || '');
+    return last && first ? (last.slice(0, 3) + first.slice(0, 3)).toUpperCase() : '';
   }
 
   // ---------- template grids ----------
@@ -162,7 +194,7 @@
   const NONPT_CLASSES = new Set(['admin', 'meeting', 'pto', 'clinical training', 'training', 'lunch']);
   function buildRef(rows){
     const m = new Map();
-    for (const r of rows || []){ const ev = lc(r.event); if (!ev) continue; m.set(ev, { event: txt(r.event), resType: txt(r.resType), sched: txt(r.sched), cls: txt(r.cls) || txt(r.event), sl: txt(r.sl), elig: txt(r.elig) }); }
+    for (const r of rows || []){ const ev = lc(r.event); if (!ev) continue; m.set(ev, { event: txt(r.event), resType: txt(r.resType), sched: txt(r.sched), cls: txt(r.cls) || txt(r.event), sl: txt(r.sl), elig: txt(r.elig), role: txt(r.role) }); }
     return m;
   }
   // kind: 'pt' (a patient visit), 'nonpt' (admin/meeting/PTO booked on the provider), 'ignore' (holds, reference rows)
@@ -173,12 +205,28 @@
       let kind = 'pt';
       if (/^reference/.test(s) || el === 'no' || el === 'never') kind = 'ignore';
       else if (NONPT_CLASSES.has(c) || s === 'admin') kind = 'nonpt';
-      return { kind, cls: r.cls || r.event, sl: r.sl || 'Unassigned', mapped: true, pto: c === 'pto' };
+      return { kind, cls: r.cls || r.event, sl: r.sl || 'Unassigned', mapped: true, pto: c === 'pto', role: kind === 'pt' ? roleOf(r.cls || r.event, r.event, r.sl, r.role) : 'admin' };
     }
     const e = lc(event);
-    if (/\bhold\b|coverage|on call|in clinic/.test(e)) return { kind: 'ignore', cls: txt(event), sl: 'Unassigned', mapped: false };
-    if (/\b(admin|meeting|lunch|pto|training|peer to peer)\b/.test(e)) return { kind: 'nonpt', cls: txt(event), sl: 'N/A', mapped: false, pto: /\bpto\b/.test(e) };
-    return { kind: 'pt', cls: txt(event), sl: guessServiceLine(e), mapped: false };
+    if (/\bhold\b|coverage|on call|in clinic/.test(e)) return { kind: 'ignore', cls: txt(event), sl: 'Unassigned', mapped: false, role: 'admin' };
+    if (/\b(admin|meeting|lunch|pto|training|peer to peer)\b/.test(e)) return { kind: 'nonpt', cls: txt(event), sl: 'N/A', mapped: false, pto: /\bpto\b/.test(e), role: 'admin' };
+    return { kind: 'pt', cls: txt(event), sl: guessServiceLine(e), mapped: false, role: roleOf(event, event, guessServiceLine(e)) };
+  }
+  // What a visit is for in a course of care: consult | start | treatment | followup | admin. The Ref tab's Role column wins;
+  // otherwise a guess from the class and event name. IV ketamine start/index and esketamine follow-ups (the dosing visit)
+  // count as treatment; Provider MT and esketamine starts count as start.
+  const ROLES = ['consult', 'start', 'treatment', 'followup', 'admin'];
+  function roleOf(cls, event, sl, given){
+    const g = lc(given).replace(/[^a-z]/g, ''); const hit = ROLES.find(r => r === g || (r === 'followup' && g === 'fu')); if (hit) return hit;
+    const e = lc(cls) + ' ' + lc(event); const line = lc(sl);
+    if (/\b(admin|meeting|lunch|pto|training)\b/.test(e)) return 'admin';
+    if (/consult|intake|new patient|evaluation|\beval\b/.test(e)) return 'consult';
+    if (/\b(ivk|iv ketamine)\b/.test(e) || /\bivk\b/.test(line)) return 'treatment';
+    if (/\bstart\b|motor threshold|\bmt\b|mapping|redo/.test(e)) return 'start';
+    if (/\befu\b|esk(etamine)?\s*(follow|f\/u)|dosing|treatment|\btx\b|session|infusion/.test(e)) return 'treatment';
+    if (/follow|f\/u|post|check/.test(e)) return 'followup';
+    if (/\b(tms|esk)\b/.test(line)) return 'treatment';
+    return 'followup';
   }
   function guessServiceLine(e){
     e = lc(e);
@@ -216,14 +264,16 @@
 
   // ---------- appointment list ----------
   const COLS = {
-    date: /^(appt\.?\s*)?date$|^appointment date$/i, time: /^(start\s*)?time$|^appt\.?\s*time$|^start$/i, end: /^end\s*(tm|time)?$/i,
+    date: /^(appt\.?\s*)?date$|^appointment date$/i, time: /^(start\s*)?time$|^appt\.?\s*time$|^start$|^beg(in)?\.?\s*(tm|time)$/i, end: /^end\s*(tm|time)?$/i,
     dur: /^duration|^length|^mins?$/i, prov: /^(provider|resource|rendering|rendering provider|resource name)$/i, event: /^(event|appt\.?\s*type|appointment type|event name|type)$/i,
-    status: /^(status|appt\.?\s*status|sts)$/i, loc: /^(location|site|clinic|loc)$/i,
+    status: /^(status|appt\.?\s*status|sts)$/i, loc: /^(location|site|clinic|loc|loc\.?\s*name|location\s*name)$/i,
     booked: /^(created|create(d)?\s*(date|on|dt)|crt\.?\s*(dt|date)|date\s*created|scheduled\s*(on|date)|date\s*scheduled|booked(\s*(on|date))?|appt\.?\s*made|made\s*on|entered(\s*(on|date))?|entry\s*date|create\s*timestamp)$/i,
     bookedTime: /^(create(d)?\s*time|scheduled\s*time|booked\s*time|entry\s*time)$/i,
     cancel: /^(cancel(l)?(ed)?\s*(date|on|dt|date\/time|timestamp)?|date\s*cancel(l)?(ed)?|cxl\s*(date|dt))$/i,
     cancelTime: /^(cancel(l)?(ed)?\s*time|cxl\s*time)$/i,
     reason: /^(cancel(l)?(ation)?\s*reason|reason|cxl\s*reason|cancel\s*code)$/i,
+    pt: /^((pat\.?|patient|pt\.?|person)\s*name|patient)$/i,
+    mrn: /^(md\s*rc|med\.?\s*rec(\.|ord)?\s*(nbr|no\.?|#|number)?|mrn|person\s*(nbr|no\.?|#|number|id)|patient\s*(id|nbr|no\.?|#|number)|chart\s*(nbr|no\.?|#|number))$/i,
   };
   function findHeader(values){
     for (let r = 0; r < Math.min(values.length, 40); r++){
@@ -256,25 +306,27 @@
       if (booked != null && c.bookedTime != null){ const t = parseTime(v[c.bookedTime]); if (t != null) booked = Math.floor(booked) + t / 1440; }
       let cancelAt = c.cancel != null ? parseDateTime(v[c.cancel]) : null;
       if (cancelAt != null && c.cancelTime != null){ const t = parseTime(v[c.cancelTime]); if (t != null) cancelAt = Math.floor(cancelAt) + t / 1440; }
-      rows.push({ date, start, dur, prov: txt(v[c.prov]), event: txt(v[c.event]), status: normStatus(v[c.status]), rawStatus: txt(v[c.status]), loc: c.loc != null ? txt(v[c.loc]) : '', booked, cancelAt, reason: c.reason != null ? txt(v[c.reason]) : '' });
+      rows.push({ date, start, dur, prov: txt(v[c.prov]), event: txt(v[c.event]), status: normStatus(v[c.status]), rawStatus: txt(v[c.status]), loc: c.loc != null ? txt(v[c.loc]) : '', booked, cancelAt, reason: c.reason != null ? txt(v[c.reason]) : '', pt: c.pt != null ? txt(v[c.pt]) : '', mrn: c.mrn != null ? txt(v[c.mrn]) : '' });
     }
     const dates = rows.map(x => x.date);
     return { rows, header: h, runAt: findRunDate(values, h.row), skipped, min: dates.length ? Math.min(...dates) : null, max: dates.length ? Math.max(...dates) : null,
-      has: { booked: c.booked != null, cancel: c.cancel != null, reason: c.reason != null, dur: c.dur != null || c.end != null, loc: c.loc != null } };
+      has: { booked: c.booked != null, cancel: c.cancel != null, reason: c.reason != null, dur: c.dur != null || c.end != null, loc: c.loc != null, pt: c.pt != null, mrn: c.mrn != null } };
   }
 
   // ---------- analysis ----------
   const ACTIVE = new Set(['Kept', 'No Show', 'Expected']);
-  function blankAcc(){ return { supply: 0, kept: 0, keptFit: 0, keptOff: 0, ns: 0, open: 0, admin: 0, pto: 0, unres: 0, futSupply: 0, futBooked: 0, aKept: 0, aNS: 0, aCx: 0, aLC: 0, aCxKnown: 0, aExp: 0, aAll: 0, inBlocked: 0, offTemplate: 0, dbl: 0, overMin: 0, lead: [] }; }
+  function blankAcc(){ return { supply: 0, kept: 0, keptFit: 0, keptOff: 0, keptRel: 0, ns: 0, open: 0, admin: 0, pto: 0, unres: 0, futSupply: 0, futBooked: 0, aKept: 0, aNS: 0, aCx: 0, aLC: 0, aCxKnown: 0, aExp: 0, aAll: 0, inBlocked: 0, offTemplate: 0, dbl: 0, overMin: 0, lead: [] }; }
   function rates(a){
     const d = (n, m) => m ? n / m : null;
-    return { ...a, fill: d(a.kept + a.ns, a.supply), util: d(a.kept, a.supply), fit: d(a.keptFit, a.kept), nsRate: d(a.aNS, a.aKept + a.aNS), cxRate: d(a.aCx, a.aKept + a.aNS + a.aCx), lcRate: a.aCxKnown ? d(a.aLC, a.aKept + a.aNS + a.aCx) : null,
+    return { ...a, fill: d(a.kept + a.ns, a.supply), util: d(a.kept, a.supply), fit: d(a.keptFit, a.kept - a.keptRel), nsRate: d(a.aNS, a.aKept + a.aNS), cxRate: d(a.aCx, a.aKept + a.aNS + a.aCx), lcRate: a.aCxKnown ? d(a.aLC, a.aKept + a.aNS + a.aCx) : null,
       missRate: d(a.aNS + (a.aCxKnown ? a.aLC : 0), a.aKept + a.aNS + a.aCx), futFill: d(a.futBooked, a.futSupply), leadMed: median(a.lead), lead: undefined };
   }
   function median(xs){ if (!xs || !xs.length) return null; const s = [...xs].sort((a, b) => a - b); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; }
 
   // inputs: { templates:[parsed grids], appts:[parsed rows], ref:[rows], slotTypes:[rows], providers:[{name,label,cred,include}], opts }
-  // opts: { asOf, from, to, lateHours (24), provs:Set|null, locs:Set|null, sls:Set|null, threeNaDays }
+  // opts: { asOf, from, to, lateHours (24), provs:Set|null, locs:Set|null, sls:Set|null, threeNaDays, releaseHours (off), dayStart, dayEnd }
+  // A release booking is made less than releaseHours business hours before the visit: any visit may take the slot then,
+  // so it never counts against template fit.
   function analyze(input){
     const o = Object.assign({ lateHours: 24 }, input.opts || {});
     const ref = buildRef(input.ref), stMap = buildSlotTypes(input.slotTypes);
@@ -309,7 +361,9 @@
       if (!keep(a)) continue;                                            // provider and location filters apply to visits too
       const c = clsOf(a); if (!c.mapped) unmapped.set(a.event, (unmapped.get(a.event) || 0) + 1);
       if (c.kind === 'ignore') continue;
-      const x = Object.assign({}, a, { kind: c.kind, cls: c.cls, sl: c.sl, pto: !!c.pto });
+      const x = Object.assign({}, a, { kind: c.kind, cls: c.cls, sl: c.sl, pto: !!c.pto, role: c.role });
+      x.leadH = a.booked != null && a.start != null ? businessHours(a.booked, a.date + a.start / 1440, o.dayStart, o.dayEnd) : null;
+      x.release = !!(o.releaseHours && x.leadH != null && x.leadH < o.releaseHours);
       if (o.sls && x.kind === 'pt' && !String(x.sl).split(',').map(s => s.trim()).some(s => o.sls.has(s))) continue;
       appts.push(x);
     }
@@ -353,7 +407,7 @@
       if (!act.length){ s.out = s.nonpt ? 'admin' : past ? 'open' : 'avail'; continue; }
       if (past){
         const kept = act.filter(a => a.status === 'Kept');
-        if (kept.length) s.out = kept.some(a => accepts(s.st, a)) ? 'keptFit' : 'keptOff';
+        if (kept.length) s.out = kept.some(a => accepts(s.st, a)) ? 'keptFit' : kept.every(a => a.release) ? 'keptRel' : 'keptOff';
         else if (act.some(a => a.status === 'No Show')) s.out = 'ns';
         else s.out = 'unresolved';                          // still "Expected" on a past date
       } else s.out = 'booked';
@@ -376,7 +430,7 @@
           if (s.out === 'pto'){ a.pto++; return; }
           if (s.out === 'unresolved'){ a.unres++; return; }   // still Expected (e.g. later today): outcome unknown, so it stays out of fill
           a.supply++;
-          if (s.out === 'keptFit'){ a.kept++; a.keptFit++; } else if (s.out === 'keptOff'){ a.kept++; a.keptOff++; } else if (s.out === 'ns') a.ns++; else if (s.out === 'admin') a.admin++; else if (s.out === 'open') a.open++;
+          if (s.out === 'keptFit'){ a.kept++; a.keptFit++; } else if (s.out === 'keptOff'){ a.kept++; a.keptOff++; } else if (s.out === 'keptRel'){ a.kept++; a.keptRel++; } else if (s.out === 'ns') a.ns++; else if (s.out === 'admin') a.admin++; else if (s.out === 'open') a.open++;
         });
         if (!past && s.out !== 'pto') bump(dim, key, a => { a.futSupply++; if (s.out === 'booked') a.futBooked++; });
       }
@@ -462,7 +516,7 @@
       offMix,
       exceptions: exceptions.sort((a, b) => a.date - b.date || (a.time || 0) - (b.time || 0)),
       hasLate: allAppts.some(a => a.cancelAt != null), hasBooked: allAppts.some(a => a.booked != null),
-      slotCount: slots.length, apptCount: appts.length,
+      slotCount: slots.length, apptCount: appts.length, slots, appts, stMap, ref,
     };
   }
 
@@ -495,6 +549,7 @@
   ];
 
   return { DAYS, dow, weekStart, iso, mdy, hhmm, hourLabel, parseTime, parseDate, parseDateTime, serialFromYMD, todaySerial,
+    businessHours, minusBusinessHours, lasfir, roleOf, ROLES, normStatus,
     nameTokens, isPersonResource, credentialOf, matchProvider, lastName, parseTemplates, copyPlan, buildRef, classify, buildSlotTypes, slotTypeOf, accepts,
     findHeader, parseAppts, analyze, readAccessModel, guessServiceLine, DEFAULT_SLOT_TYPES };
 });

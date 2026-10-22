@@ -28,7 +28,7 @@ function loadApp(Excel){
   const el = () => ({ addEventListener(){}, appendChild(){}, querySelectorAll: () => [], hidden: true, innerHTML: '', classList: { toggle(){} } });
   const sandbox = { console, setTimeout, clearTimeout, Excel, Office: undefined, window: {}, location: { href: 'https://x/taskpane.html', search: '' },
     document: { querySelector: el, querySelectorAll: () => [], addEventListener(){}, createElement: el, head: el() } };
-  sandbox.TE = require('../engine.js'); sandbox.self = sandbox;
+  sandbox.TE = require('../engine.js'); sandbox.TC = require('../cadence.js'); sandbox.self = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8') + '\n;this.__api = { OfficeStore, S };', sandbox);
   return sandbox.__api;

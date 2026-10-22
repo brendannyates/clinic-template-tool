@@ -12,7 +12,8 @@ Excel add-in for Practice Managers. Put copies of provider templates in a workbo
 | Template tabs (any name) | One weekly grid per provider in the provider-configurable layout: `Provider:`, `Location:`, `Effective From:` labels, a `Time` column, Monday–Friday headers, a slot type in each cell. Several grids can share a tab. **Setup → New template tab** makes one; copy an old one to record a revision. A copy duplicates that tab, so its colors, dropdowns and formulas come along. |
 | Appointment List | The NextGen *Appointments Listing* report. **Setup → Import NextGen report** writes it. |
 | Slot Types | Slot type → Clinical or Blocked, and what it accepts (event class, service line or event; `,` = any of, `+` = all of, `*` = anything). |
-| Ref | NextGen event → event class, service line, whether it counts (holds and reference rows don't). |
+| Ref | NextGen event → event class, service line, whether it counts (holds and reference rows don't), and Role (Consult, Start, Treatment, Follow-up). A blank Role is guessed from the event name. |
+| PT ESK Status | ESK Tracker status by LASFIR (active, paused, discontinued, completed). **Recall → Import ESK status** writes it. |
 | Providers | NextGen provider → template label, credential, include. Chairs and rooms are left out automatically. |
 
 Hidden tabs are never read.
@@ -26,16 +27,22 @@ Hidden tabs are never read.
 - **Trends**: weekly (Sunday–Saturday) fill, fit, no-show, cancel and kept volume.
 - **ESK access model**: imports the ESK Tracker's *Export for template tool* file (`mhs-access-model` v1) and compares panel need with the ESK slots in the template. IV ketamine will use the same format.
 
-Late cancels, lead time and rebuilt 3NA history need two extra report columns: **Cancel Date/Time** and **Created Date**. The tool detects them by header.
+- **Release bookings**: a visit booked less than 24 business hours ahead (Mon–Fri, 8–6, configurable) may take any slot, so it never counts against template fit.
+- **Cadence**: per provider and service line, how often patients come back: kept visits, return gaps (mean, median, usual return in weeks and its share), no-shows, a gap histogram, and a per-patient list. Treatments on chairs count toward the provider the patient last saw. Consults start a chain but aren't part of it.
+- **Funnel**: consults offered and kept, how many led to a start in the same service line within 90 days (recent consults are pending, not failures), and start hours offered and used against start hours needed (kept consults × conversion × start length).
+- **Flex slots**: for slot types that accept more than one kind of visit, which kinds actually filled them.
+- **Recall**: each patient per service line is booked, not due, overdue (1.5× the usual interval), lapsed (60 days), completed or maintenance due (TMS, inferred from 30 treatments and a follow-up), or paused / discontinued / unaccounted (ESK, from the tracker import). Lists open slots for the call list over the next 10 business days, slots entering the release window, and copies an outreach list grouped by clinic.
 
-**Write report tabs** puts the results on `TA ` tabs (counts only, no patient fields).
+Late cancels, lead time, release bookings and rebuilt 3NA history need **Cancel Date/Time** and **Created Date** (Crt Dt) on the report. Cadence, funnel and recall need **Pat Name** and ideally **Md Rc**. The tool detects them by header. Thresholds are in **Setup → Settings**.
+
+**Write report tabs** puts the results on `TA ` tabs (counts only, no patient fields). **Recall → Write patient tabs** writes `PT ` tabs that list patients by LASFIR code only (no names or record numbers).
 
 ## Development
 
-No build step. `engine.js` holds the analysis (pure functions), `app.js` the UI and Excel calls, `taskpane.html` the page.
+No build step. `engine.js` holds the template analysis and `cadence.js` the cadence, recall and funnel logic (pure functions), `app.js` the UI and Excel calls, `taskpane.html` the page.
 
 ```
-node --test tests/engine.test.js tests/office-store.test.js
+node --test tests/engine.test.js tests/office-store.test.js tests/cadence.test.js
 ```
 
 Tests use synthetic data only.

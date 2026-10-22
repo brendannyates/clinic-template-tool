@@ -6,10 +6,10 @@ const pct = (x, d = 0) => x == null || isNaN(x) ? '—' : (x * 100).toFixed(d) +
 const num = x => x == null || isNaN(x) ? '—' : Math.round(x).toLocaleString();
 const days = x => x == null ? '—' : x + (x === 1 ? ' day' : ' days');
 
-const SHEETS = { appt: 'Appointment List', ref: 'Ref', st: 'Slot Types', prov: 'Providers', hist: 'TA 3NA History' };
-const OUT_PREFIX = 'TA ';
-const VIEWS = [['overview', 'Overview'], ['templates', 'Templates'], ['access', 'Access'], ['visits', 'Visits'], ['impact', 'Provider impact'], ['trends', 'Trends'], ['setup', 'Setup']];
-const S = { view: 'overview', data: null, R: null, f: { from: '', to: '', loc: '', prov: '', sl: '' }, opts: { lateHours: 24, target: 14, asOf: '' }, heatMetric: 'fill', trendType: '', impactWhy: '', store: null, mode: 'pane', full: false };
+const SHEETS = { appt: 'Appointment List', ref: 'Ref', st: 'Slot Types', prov: 'Providers', hist: 'TA 3NA History', eskst: 'PT ESK Status' };
+const OUT_PREFIX = 'TA ', PT_PREFIX = 'PT ';   // TA tabs are counts only; PT tabs list patients by LASFIR code
+const VIEWS = [['overview', 'Overview'], ['templates', 'Templates'], ['access', 'Access'], ['cadence', 'Cadence'], ['funnel', 'Funnel'], ['recall', 'Recall'], ['visits', 'Visits'], ['impact', 'Provider impact'], ['trends', 'Trends'], ['setup', 'Setup']];
+const S = { view: 'overview', data: null, R: null, f: { from: '', to: '', loc: '', prov: '', sl: '' }, opts: { lateHours: 24, target: 14, asOf: '', releaseHours: 24, convDays: 90, lapsedDays: 60, overdueMult: 1.5, tmsCount: 30, maintDays: 180, matchDays: 10, dayStart: '08:00', dayEnd: '18:00' }, heatMetric: 'fill', trendType: '', impactWhy: '', recallState: 'call', store: null, mode: 'pane', full: false };
 
 // ---------- small UI helpers ----------
 function toast(kind, html, ms = 5000){ const d = document.createElement('div'); d.className = 'msg ' + kind; d.innerHTML = html; $('#toast').appendChild(d); setTimeout(() => d.remove(), ms); }
@@ -45,7 +45,7 @@ function OfficeStore(){
       const apptX = info.find(x => !x.hidden && dims(x) && /^(appointment list|appt list)/i.test(x.name)) || info.find(x => dims(x) && /appointment|appt/i.test(x.name) && dims(x).rows > 50);
       const cfgKey = n => Object.entries(SHEETS).find(([k, v]) => k !== 'appt' && v.toLowerCase() === n.toLowerCase());
       // templates live on small visible sheets; hidden sheets and report tabs are never read
-      const small = info.filter(x => x !== apptX && dims(x) && !x.hidden && !x.name.startsWith(OUT_PREFIX) && !cfgKey(x.name) && dims(x).rows <= 800 && dims(x).cols <= 80);
+      const small = info.filter(x => x !== apptX && dims(x) && !x.hidden && !x.name.startsWith(OUT_PREFIX) && !x.name.startsWith(PT_PREFIX) && !cfgKey(x.name) && dims(x).rows <= 800 && dims(x).cols <= 80);
       for (let i = 0; i < small.length; i += 6){
         const batch = small.slice(i, i + 6).map(x => { const d = dims(x); const g = x.ws.getRangeByIndexes(0, 0, d.rows, d.cols); g.load('values'); return { x, g }; });
         await ctx.sync(); batch.forEach(b => { out.grids[b.x.name] = b.g.values; });
@@ -147,7 +147,7 @@ function openFull(){
       try {
         if (!RELAY_OPS.includes(op)) throw new Error('Unknown request');
         let r = await S.store[op](...(args || []));
-        if (op === 'load') r = Object.assign({}, r, { docs: { ctOpts: S.store.getDoc('ctOpts'), ctEsk: S.store.getDoc('ctEsk'), ctFilters: S.store.getDoc('ctFilters') } });
+        if (op === 'load') r = Object.assign({}, r, { docs: { ctOpts: S.store.getDoc('ctOpts'), ctEsk: S.store.getDoc('ctEsk'), ctEskAt: S.store.getDoc('ctEskAt'), ctFilters: S.store.getDoc('ctFilters') } });
         reply({ rid, ok: true, res: r ?? null });
       } catch (e){ reply({ rid, ok: false, err: e.message || String(e) }); }
     });
@@ -165,7 +165,7 @@ function cfgRows(values, spec){
   return values.slice(hr + 1).filter(r => r.some(v => String(v).trim())).map(r => Object.fromEntries(Object.entries(idx).map(([k, i]) => [k, r[i]])));
 }
 const SPEC = {
-  ref: { event: /^event$/i, resType: /^resource/i, sched: /schedule\s*class/i, cls: /^event\s*class/i, sl: /^service\s*line/i, elig: /eligible/i },
+  ref: { event: /^event$/i, resType: /^resource/i, sched: /schedule\s*class/i, cls: /^event\s*class/i, sl: /^service\s*line/i, elig: /eligible/i, role: /^role$/i },
   st: { type: /^slot\s*type$|^type$/i, kind: /^kind$/i, accepts: /^accepts?/i, notes: /^notes?$/i },
   prov: { name: /^nextgen|^provider$/i, label: /template\s*label|^label$/i, cred: /^cred/i, include: /^include/i },
   hist: { date: /^snapshot/i, prov: /^provider$/i, type: /^slot\s*type$/i, next: /^next/i, third: /^3na/i, open: /^open/i },
@@ -180,18 +180,42 @@ function prepare(raw){
     ref: cfgRows(raw.cfg.ref, SPEC.ref), refExists: !!raw.cfg.ref,
     st: cfgRows(raw.cfg.st, SPEC.st), stExists: !!raw.cfg.st,
     prov: cfgRows(raw.cfg.prov, SPEC.prov).map(p => ({ name: String(p.name || '').trim(), label: String(p.label || '').trim(), cred: String(p.cred || '').trim(), include: p.include })), provExists: !!raw.cfg.prov,
+    eskStatus: raw.cfg.eskst ? TC.readEskStatus(raw.cfg.eskst) : null,
     hist: cfgRows(raw.cfg.hist, SPEC.hist).map(h => ({ date: TE.parseDate(h.date), prov: String(h.prov || ''), type: String(h.type || ''), next: h.next === '' ? null : +h.next, third: h.third === '' ? null : +h.third, open: +h.open || 0 })),
   };
 }
 const stRows = () => S.data.st.length ? S.data.st : TE.DEFAULT_SLOT_TYPES.map(r => ({ type: r[0], kind: r[1], accepts: r[2] }));
 function asOfSerial(){ const o = TE.parseDate(S.opts.asOf); if (o != null) return o; const r = S.data && S.data.ap && S.data.ap.runAt; return r != null ? Math.floor(r) : TE.todaySerial(); }
+// cadence and recall settings, with the defaults from the spec
+function copts(){
+  const o = S.opts, tm = (v, d) => { const x = TE.parseTime(v); return x == null ? d : x; };
+  return { releaseHours: +o.releaseHours || 24, convDays: +o.convDays || 90, lapsedDays: +o.lapsedDays || 60, overdueMult: +o.overdueMult || 1.5, tmsCount: +o.tmsCount || 30,
+    maintDays: +o.maintDays || 180, matchDays: +o.matchDays || 10, dayStart: tm(o.dayStart, 480), dayEnd: tm(o.dayEnd, 1080) };
+}
 function run(){
-  const d = S.data; if (!d || !d.ap || d.ap.error){ S.R = null; return; }
-  const f = S.f; const P = s => TE.parseDate(s);
+  const d = S.data; if (!d || !d.ap || d.ap.error){ S.R = null; S.C = null; return; }
+  const f = S.f; const P = s => TE.parseDate(s); const co = copts();
   S.R = TE.analyze({
     templates: d.templates.map(t => Object.assign({}, t)), appts: d.ap.rows, ref: d.ref, slotTypes: stRows(), providers: d.prov,
-    opts: { asOf: asOfSerial(), from: P(f.from), to: P(f.to), lateHours: +S.opts.lateHours || 24, provs: f.prov ? new Set([f.prov]) : null, locs: f.loc ? new Set([f.loc]) : null, sls: f.sl ? new Set([f.sl]) : null },
+    opts: { asOf: asOfSerial(), from: P(f.from), to: P(f.to), lateHours: +S.opts.lateHours || 24, provs: f.prov ? new Set([f.prov]) : null, locs: f.loc ? new Set([f.loc]) : null, sls: f.sl ? new Set([f.sl]) : null,
+      releaseHours: co.releaseHours, dayStart: co.dayStart, dayEnd: co.dayEnd },
   });
+  runCadence(co);
+}
+// patient-level views need a patient column; everything else works without one
+function runCadence(co){
+  const d = S.data, R = S.R; S.C = null; S.Cerr = null;
+  if (!d.ap.has.pt && !d.ap.has.mrn) return;
+  try {
+    const one = x => x ? new Set([x]) : null;
+    const o = Object.assign({}, co, { asOf: R.asOf, from: R.from, to: R.to, provs: one(S.f.prov), sls: one(S.f.sl), locs: one(S.f.loc) });
+    const v = TC.visits(d.ap.rows, d.ref, o, new Set(R.people));
+    const cad = TC.cadence(v.list, o);
+    const esk = d.eskStatus && !d.eskStatus.error ? d.eskStatus : null;
+    const rc = TC.recall(v.list, o, cad, esk);
+    const now = d.ap.runAt != null && !S.opts.asOf ? d.ap.runAt : R.asOf + co.dayStart / 1440;   // report run time, else the start of the as-of day
+    S.C = { o, v, cad, rc, now, esk, fun: TC.funnel(v.list, R, o), flex: TC.flexUsage(R, v.list, o), rel: TC.releaseList(R, o, now), matches: TC.slotMatches(rc, R, v.list, o, now) };
+  } catch (e){ console.error(e); S.Cerr = e.message || String(e); }
 }
 async function reload(){
   busy(true, 'Reading the workbook…');
@@ -200,6 +224,7 @@ async function reload(){
     S.data = prepare(raw);
     S.opts = Object.assign(S.opts, S.store.getDoc('ctOpts') || {});
     S.esk = S.store.getDoc('ctEsk') || null;
+    S.eskAt = S.store.getDoc('ctEskAt') || null;
     run(); S.err = null;
   } catch (e){ console.error(e); S.err = e.message || String(e); }
   finally { busy(false); render(); }
@@ -316,9 +341,10 @@ function vTemplates(){
     <div class="legend">Low <i style="background:linear-gradient(90deg,var(--q1),var(--q4),var(--q7))"></i> High${heatM === 'ns' || heatM === 'cx' ? ` (scale tops out at ${pct(maxV, 1)})` : ''}</div>`;
   const tplRows = S.data.templates.map(t => ({ t, prov: (R.templates.find(x => x.sheet === t.sheet && x.anchor[0] === t.anchor[0] && x.anchor[1] === t.anchor[1]) || {}).provider }));
   const wk = t => { let c = 0, b = 0; t.slots.forEach(s => { TE.slotTypeOf(st, s.type).kind === 'clinical' ? c++ : b++; }); return { c, b }; };
-  return `<div class="card"><h2>Slot types</h2><div class="tw"><table><thead><tr><th>Slot type</th><th class="n">Slots</th><th class="n">Filled</th><th class="n">Template fit</th><th class="n">Kept as intended</th><th class="n">Kept, other visit</th><th class="n">No-show</th><th class="n">Open</th><th class="n">To admin</th><th class="n">Booked ahead</th><th>Most common other visits</th></tr></thead><tbody>
-    ${rows.map(r => `<tr><td>${esc(r.key)}${st.get(String(r.key).toLowerCase()) ? '' : ' <span class="chip warn" data-tip="Not on the Slot Types tab; using a guess">?</span>'}</td>${barCell(r.supply, maxS, num(r.supply))}<td class="n">${pct(r.fill)}</td><td class="n">${pct(r.fit)}</td><td class="n">${num(r.keptFit)}</td><td class="n">${num(r.keptOff)}</td><td class="n">${num(r.ns)}</td><td class="n">${num(r.open)}</td><td class="n">${num(r.admin)}</td><td class="n">${pct(r.futFill)}</td><td class="small">${mixOf(r.key)}</td></tr>`).join('')}
-    </tbody></table></div><div class="small muted" style="margin-top:6px">Template fit uses the Accepts column on the Slot Types tab. "To admin" = a clinical slot taken by an admin or meeting event in NextGen. PTO slots are left out of the slot counts.</div></div>
+  return `<div class="card"><h2>Slot types</h2><div class="tw"><table><thead><tr><th>Slot type</th><th class="n">Slots</th><th class="n">Filled</th><th class="n">Template fit</th><th class="n">Kept as intended</th><th class="n">Kept, other visit</th><th class="n">Release bookings</th><th class="n">No-show</th><th class="n">Open</th><th class="n">To admin</th><th class="n">Booked ahead</th><th>Most common other visits</th></tr></thead><tbody>
+    ${rows.map(r => `<tr><td>${esc(r.key)}${st.get(String(r.key).toLowerCase()) ? '' : ' <span class="chip warn" data-tip="Not on the Slot Types tab; using a guess">?</span>'}</td>${barCell(r.supply, maxS, num(r.supply))}<td class="n">${pct(r.fill)}</td><td class="n">${pct(r.fit)}</td><td class="n">${num(r.keptFit)}</td><td class="n">${num(r.keptOff)}</td><td class="n">${num(r.keptRel)}</td><td class="n">${num(r.ns)}</td><td class="n">${num(r.open)}</td><td class="n">${num(r.admin)}</td><td class="n">${pct(r.futFill)}</td><td class="small">${mixOf(r.key)}</td></tr>`).join('')}
+    </tbody></table></div><div class="small muted" style="margin-top:6px">Template fit uses the Accepts column on the Slot Types tab. A release booking (made under ${copts().releaseHours} business hours before the visit) may take any slot, so it doesn’t count against fit. "To admin" = a clinical slot taken by an admin or meeting event in NextGen. PTO slots are left out of the slot counts.</div></div>
+  ${flexCard()}
   <div class="card"><h2>Day of week × time of day <span class="sp"></span><select data-act="heatMetric">${[['fill', 'Filled %'], ['util', 'Kept use %'], ['ns', 'No-show %'], ['cx', 'Cancel %'], ['kept', 'Kept visits']].map(([v, l]) => `<option value="${v}"${v === heatM ? ' selected' : ''}>${l}</option>`).join('')}</select></h2>${heat}</div>
   <div class="cols"><div class="card"><h2>Morning vs afternoon</h2><table><thead><tr><th></th><th class="n">Slots</th><th class="n">Filled</th><th class="n">Fit</th><th class="n">No-show</th><th class="n">Cancel</th></tr></thead><tbody>${R.byPart.filter(p => p.key !== 'No time').map(p => `<tr><td>${p.key}</td><td class="n">${num(p.supply)}</td><td class="n">${pct(p.fill)}</td><td class="n">${pct(p.fit)}</td><td class="n">${pct(p.nsRate, 1)}</td><td class="n">${pct(p.cxRate, 1)}</td></tr>`).join('')}</tbody></table></div>
   <div class="card"><h2>Templates in this workbook</h2><div class="tw"><table><thead><tr><th>Tab</th><th>Label</th><th>Linked provider</th><th>Location</th><th>Applies from</th><th class="n">Clinical / wk</th><th class="n">Blocked / wk</th></tr></thead><tbody>${tplRows.map(({ t, prov }) => { const w = wk(t); return `<tr><td>${esc(t.sheet)}</td><td>${esc(t.label)}</td><td>${prov ? esc(prov) : '<span class="chip bad">Not linked</span>'}</td><td>${esc(t.location)}</td><td>${t.effFrom != null ? TE.mdy(t.effFrom) : '<span class="muted">All dates</span>'}</td><td class="n">${w.c}</td><td class="n">${w.b}</td></tr>`; }).join('') || '<tr><td colspan="7" class="muted">No template grids found. Use Setup → New template tab.</td></tr>'}</tbody></table></div>
@@ -352,6 +378,77 @@ function eskCard(){
     ${rows.map(({ p, nm, ours }) => `<tr><td>${esc(p.Provider)}</td><td>${esc(nm)}</td><td>${esc(p.Credential)}</td><td class="n">${num(+p.Patients)}</td><td class="n">${esc(p['Need per week'])}</td><td class="n">${esc(p['Template slots per week'])}</td><td class="n">${ours == null ? '—' : ours}</td><td class="n">${esc(p['Booked per week'])}</td></tr>`).join('')}
     </tbody></table></div><div class="small muted" style="margin-top:6px">From the ESK Tracker’s Access export. Need per week is the panel’s expected visits; compare it with the slots this template workbook gives ESK.</div></div>`;
 }
+// ---------- cadence, funnel, recall ----------
+const ROLE_LABEL = { consult: 'Consult', start: 'Start', treatment: 'Treatment', followup: 'Follow-up', admin: 'Admin' };
+const STATE = { overdue: ['warn', 'Overdue'], lapsed: ['bad', 'Lapsed'], unaccounted: ['bad', 'Unaccounted'], maintenance: ['warn', 'Maintenance due'], active: ['ok', 'Booked'], current: ['mute', 'Not due'], completed: ['mute', 'Completed'], paused: ['mute', 'Paused'], discontinued: ['mute', 'Discontinued'] };
+const stateChip = s => `<span class="chip ${(STATE[s] || ['mute'])[0]}">${esc((STATE[s] || [0, s])[1])}</span>`;
+const code = c => c ? esc(c) : '<span class="muted" data-tip="Pat Name isn’t in “Last, First” form, so no LASFIR code">(check name)</span>';
+const gapD = x => x == null ? '—' : Math.round(x) + ' d';
+function needPatients(){
+  if (S.Cerr) return `<div class="card"><div class="msg bad">Couldn’t work out cadence: ${esc(S.Cerr)}</div></div>`;
+  return `<div class="card"><h2>Needs a patient column</h2><div class="msg info">Cadence, funnel and recall follow each patient from visit to visit. Add <b>Pat Name</b> (and <b>Md Rc</b>, so two patients with the same name stay apart) to the NextGen report, then import it again. The tool shows and writes LASFIR codes only.</div></div>`;
+}
+function vCadence(){
+  const C = S.C; if (!C) return needPatients();
+  const rows = C.cad.rows.filter(r => r.patients); const H = C.cad.hist;
+  const hc = (n, tot) => { const f = tot ? n / tot : null; return `<td class="h" style="background:${seq(n ? f : null)};color:${seqInk(f)}" data-tip="${esc(`${n} of ${tot} returns`)}">${tot && n ? pct(f) : ''}</td>`; };
+  const pts = C.cad.patients;
+  return `<div class="card"><h2>How often patients come back</h2>
+    <div class="tw"><table class="heat"><thead><tr><th>Provider</th><th>Service line</th><th class="n">Patients</th><th class="n">Kept visits</th><th class="n">Visits / patient</th><th class="n">Returning</th><th class="n">Mean gap</th><th class="n">Median gap</th><th class="n">Usual return</th><th class="n">No-show</th><th class="n">Tele</th>${H.map(h => `<th class="n">${esc(h)}</th>`).join('')}</tr></thead><tbody>
+    ${rows.map(r => `<tr${r.prov === 'All providers' ? ' class="tot"' : ''}><td>${esc(r.prov)}</td><td>${esc(r.bucket)}</td><td class="n">${num(r.patients)}</td><td class="n">${num(r.kept)}</td><td class="n">${r.perPt == null ? '—' : r.perPt.toFixed(1)}</td><td class="n">${num(r.returning)}</td><td class="n">${gapD(r.mean)}</td><td class="n">${gapD(r.median)}</td><td class="n">${r.modeWk == null ? '—' : `${r.modeWk === 1 ? '≤1' : r.modeWk} wk <span class="muted">(${pct(r.modeShare)})</span>`}</td><td class="n">${pct(r.nsRate, 1)}</td><td class="n">${pct(r.telePct)}</td>${r.hist.map(n => hc(n, r.n)).join('')}</tr>`).join('') || '<tr><td colspan="19" class="muted">No kept visits in this range.</td></tr>'}
+    </tbody></table></div>
+    <div class="small muted" style="margin-top:6px">Kept visits only; same-day bookings count once. Gaps are days between a patient’s kept visits in the same service line, credited to the provider they last saw in it (TMS and ESK treatments on chairs count toward that provider). Usual return is the most common gap in whole weeks, with the share of gaps that fall in it. Consults start a chain but aren’t part of it (see Funnel). No-show rate = no-shows ÷ (kept + no-shows).</div></div>
+  <div class="card"><h2>By patient <span class="chip mute">${num(pts.length)}</span></h2>
+    <div class="tw" style="max-height:480px"><table><thead><tr><th>Patient</th><th>Provider</th><th>Service line</th><th class="n">Kept</th><th>First seen</th><th>Last seen</th><th class="n">Mean gap</th><th class="n">Last gap</th><th>Modality</th></tr></thead><tbody>
+    ${pts.slice(0, 400).map(p => `<tr><td>${code(p.code)}</td><td>${esc(p.prov)}</td><td>${esc(p.bucket)}</td><td class="n">${num(p.kept)}</td><td>${TE.mdy(p.first)}</td><td>${TE.mdy(p.last)}</td><td class="n">${gapD(p.meanGap)}</td><td class="n">${gapD(p.lastGap)}</td><td class="small">${p.telePct == null ? '' : `Tele ${pct(p.telePct)} / In person ${pct(1 - p.telePct)}`}</td></tr>`).join('')}
+    </tbody></table></div>${pts.length > 400 ? `<div class="small muted">Showing 400 of ${num(pts.length)}. Write patient tabs for the full list.</div>` : ''}</div>`;
+}
+function vFunnel(){
+  const C = S.C; if (!C) return needPatients();
+  const rows = C.fun; const co = C.o;
+  const flag = r => r.flag === 'over' ? '<span class="chip warn">More than needed</span>' : r.flag === 'under' ? '<span class="chip bad">Short</span>' : r.flag === 'ok' ? '<span class="chip ok">About right</span>' : '';
+  const h = x => x == null ? '—' : x.toFixed(1);
+  return `<div class="card"><h2>Consult to start</h2>
+    <div class="tw"><table><thead><tr><th>Provider</th><th>Service line</th><th class="n">Consult slots</th><th class="n">Consults kept</th><th class="n">Consult fill</th><th class="n">Started</th><th class="n">Pending</th><th class="n">Conversion</th><th class="n">Median days to start</th><th class="n">Start hours offered</th><th class="n">Start hours used</th><th class="n">Start hours needed</th><th></th></tr></thead><tbody>
+    ${rows.map(r => `<tr><td>${esc(r.prov)}</td><td>${esc(r.sl)}</td><td class="n">${num(r.consultSlots)}</td><td class="n">${num(r.consults)}</td><td class="n">${pct(r.consultFill)}</td><td class="n">${num(r.converted)}</td><td class="n">${num(r.pending)}</td><td class="n">${pct(r.rate)}</td><td class="n">${r.medDays == null ? '—' : days(Math.round(r.medDays))}</td><td class="n">${h(r.startHoursOffered)}</td><td class="n">${h(r.startHoursUsed)}</td><td class="n">${h(r.startHoursNeeded)}</td><td>${flag(r)}</td></tr>`).join('') || '<tr><td colspan="13" class="muted">No kept consults in this range.</td></tr>'}
+    </tbody></table></div>
+    <div class="small muted" style="margin-top:6px">A consult converts when the same patient has a kept start (Provider MT, ESK start and similar) in that service line within ${co.convDays} days, with any provider. Consults from the last ${co.convDays} days that haven’t started yet are pending and left out of the rate. Start hours needed = kept consults × conversion × start visit length; size start time from this, not from the consult hours offered. Slots come from this provider’s template; Open Schedule and other flex slots count toward both consults and starts.</div></div>`;
+}
+function flexCard(){
+  const C = S.C; if (!C || !C.flex.length) return '';
+  const roles = ['consult', 'start', 'treatment', 'followup'];
+  return `<div class="card"><h2>Flex slots: what actually fills them</h2><div class="tw"><table><thead><tr><th>Provider</th><th>Slot type</th><th>Accepts</th><th class="n">Offered</th><th class="n">Used</th><th class="n">Use</th>${roles.map(r => `<th class="n">${ROLE_LABEL[r]}</th>`).join('')}<th class="n">Release bookings</th></tr></thead><tbody>
+    ${C.flex.map(r => `<tr><td>${esc(r.prov)}</td><td>${esc(r.type)}</td><td class="small">${r.accepts.map(x => ROLE_LABEL[x]).join(', ') || 'Anything'}</td><td class="n">${num(r.offered)}</td><td class="n">${num(r.used)}</td><td class="n">${pct(r.useRate)}</td>${roles.map(x => `<td class="n">${num(r.roles[x] || 0)}</td>`).join('')}<td class="n">${num(r.release)} <span class="muted">${r.used ? '(' + pct(r.releaseShare) + ')' : ''}</span></td></tr>`).join('')}
+    </tbody></table></div><div class="small muted" style="margin-top:6px">Flex = a slot type whose Accepts list takes two or more kinds of visit. If a consult/start flex pool is mostly starts, it has quietly become start overflow.</div></div>`;
+}
+function vRecall(){
+  const C = S.C; if (!C) return needPatients();
+  const counts = {}; C.rc.forEach(r => { counts[r.state] = (counts[r.state] || 0) + 1; });
+  const call = C.rc.filter(r => TC.CALL.has(r.state));
+  const pick = S.recallState === 'call' ? call : S.recallState ? C.rc.filter(r => r.state === S.recallState) : C.rc;
+  const opt = (v, l) => `<option value="${v}"${v === S.recallState ? ' selected' : ''}>${l}</option>`;
+  const eskAge = S.eskAt != null ? TE.todaySerial() - S.eskAt : null;
+  const esk = S.data.eskStatus;
+  const eskLine = esk && esk.error ? `<span class="chip bad">${esc(esk.error)}</span>` : esk ? `<span class="chip ${eskAge != null && eskAge > 7 ? 'warn' : 'mute'}">ESK Tracker: ${num(esk.rows.length)} patients${S.eskAt != null ? ', imported ' + TE.mdy(S.eskAt) : ''}</span>` : '<span class="chip mute">No ESK Tracker status loaded</span>';
+  const t = (d, m) => `${TE.DAYS[TE.dow(d)].slice(0, 3)} ${TE.mdy(d)} ${TE.hhmm(m)}`;
+  const m = C.matches;
+  return `<div class="card"><h2>Recall <span class="sp"></span><select data-act="recallState">${opt('call', `Call list (${num(call.length)})`)}${opt('', `Everyone (${num(C.rc.length)})`)}${Object.keys(STATE).filter(k => counts[k]).map(k => opt(k, `${STATE[k][1]} (${num(counts[k])})`)).join('')}</select>
+      <button class="btn sm primary" data-act="copyOutreach">Copy outreach list</button><label class="btn sm">Import ESK status…<input type="file" accept=".csv,.xlsx,.xls" data-act="importEskStatus" hidden></label><button class="btn sm" data-act="writePatients">Write patient tabs</button></h2>
+    <div class="row" style="margin-bottom:6px">${Object.keys(STATE).filter(k => counts[k]).map(k => `<span class="small">${stateChip(k)} ${num(counts[k])}</span>`).join('')}${eskLine}</div>
+    <div class="tw" style="max-height:520px"><table><thead><tr><th>Patient</th><th>Provider</th><th>Service line</th><th>Clinic</th><th>Last seen</th><th class="n">Days since</th><th class="n">Usual interval</th><th>State</th><th>Since then</th><th>Next booked</th><th>ESK Tracker</th><th>Return date</th><th>Pause reason</th></tr></thead><tbody>
+    ${pick.slice(0, 500).map(r => `<tr><td>${code(r.code)}</td><td>${esc(r.prov)}</td><td>${esc(r.bucket)}</td><td>${esc(r.loc)}</td><td>${TE.mdy(r.last)}</td><td class="n">${num(r.daysSince)}</td><td class="n">${r.exp == null ? '—' : r.exp + ' d'}</td><td>${stateChip(r.state)}</td><td>${r.post ? `<span class="chip warn">${esc(r.post)}</span>` : ''}</td><td>${r.next != null ? TE.mdy(r.next) : ''}</td><td class="small">${esc(r.tracker)}</td><td>${r.ret != null ? TE.mdy(r.ret) : ''}</td><td class="small">${esc(r.reason)}</td></tr>`).join('') || '<tr><td colspan="13" class="muted">Nobody in this group.</td></tr>'}
+    </tbody></table></div>${pick.length > 500 ? `<div class="small muted">Showing 500 of ${num(pick.length)}. Write patient tabs for the full list.</div>` : ''}
+    <div class="small muted" style="margin-top:6px">As of ${TE.mdy(S.R.asOf)}. Overdue = more than ${C.o.overdueMult}× the service line’s usual return interval since the last kept visit, with nothing booked. Lapsed = over ${C.o.lapsedDays} days. TMS counts as completed after ${C.o.tmsCount} treatments and a follow-up, and comes back as maintenance due after ${C.o.maintDays} days. Paused and discontinued come from the ESK Tracker import; an overdue ESK patient the tracker doesn’t list is unaccounted. “Since then” flags a no-show or cancel after the last kept visit.</div></div>
+  <div class="cols"><div class="card"><h2>Open slots for the call list <span class="chip mute">next ${C.o.matchDays} business days</span></h2>
+    <div class="tw" style="max-height:420px"><table><thead><tr><th>Patient</th><th>Service line</th><th>Slot with</th><th>When</th><th>Slot type</th><th>Why it fits</th></tr></thead><tbody>
+    ${m.slice(0, 300).map(x => `<tr><td>${code(x.code)}</td><td>${esc(x.bucket)}</td><td>${esc(x.prov)}${x.prov === x.patientProv ? '' : ' <span class="chip mute">other provider</span>'}</td><td>${t(x.date, x.min)}</td><td>${esc(x.type)}</td><td>${x.why === 'released' ? '<span class="chip ok">Released</span>' : x.why === 'flex' ? '<span class="chip mute">Flex</span>' : 'Takes this visit'}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">No open template slots match.</td></tr>'}
+    </tbody></table></div><div class="small muted" style="margin-top:6px">Up to three per patient: their own provider first, then the soonest. Released = inside the ${C.o.releaseHours}-business-hour window, open to any visit.</div></div>
+  <div class="card"><h2>Opening for any visit <span class="chip mute">release window</span></h2>
+    <div class="tw" style="max-height:420px"><table><thead><tr><th>Provider</th><th>Slot</th><th>Slot type</th><th>Status</th></tr></thead><tbody>
+    ${C.rel.map(x => `<tr><td>${esc(x.prov)}</td><td>${t(x.date, x.min)}</td><td>${esc(x.type)}</td><td>${x.released ? '<span class="chip ok">Open to any visit now</span>' : `Opens ${t(Math.floor(x.enters), Math.round((x.enters % 1) * 1440))}`}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">No open slots in or near the window.</td></tr>'}
+    </tbody></table></div><div class="small muted" style="margin-top:6px">Open template slots less than ${C.o.releaseHours} business hours away (Mon–Fri, ${TE.hhmm(C.o.dayStart)}–${TE.hhmm(C.o.dayEnd)}), plus the ones that cross into the window by the end of the next business day. Counted from ${t(Math.floor(C.now), Math.round((C.now % 1) * 1440))}.</div></div></div>`;
+}
+
 function rateTable(rows, label, showLead){
   const R = S.R; const max = Math.max(1, ...rows.map(r => r.aAll));
   return `<div class="tw"><table><thead><tr><th>${label}</th><th class="n">Visits</th><th class="n">Kept</th><th class="n">No-show</th><th class="n">Cancel</th><th class="n">Late cx</th>${showLead ? '<th class="n">Median lead</th>' : ''}</tr></thead><tbody>
@@ -402,7 +499,7 @@ function vSetup(){
   return `<div class="card"><h2>Appointment list</h2>
     ${!ap ? `<div class="msg warn">No Appointment List tab yet. Import the NextGen appointment report below.</div>` : ap.error ? `<div class="msg bad">${esc(ap.error)} (tab “${esc(ap.sheet)}”)</div>` :
     `<div class="small">Tab <b>${esc(ap.sheet)}</b>: ${num(ap.rows.length)} visits, ${TE.mdy(ap.min)} – ${TE.mdy(ap.max)}${ap.runAt != null ? `, report run ${TE.mdy(ap.runAt)} ${TE.hhmm(Math.round((ap.runAt % 1) * 1440))}` : ''}.</div>
-     <div class="row" style="margin:6px 0">${flag(true, 'Date, time, provider, event, status')}${flag(has.dur, 'Duration / end time')}${flag(has.loc, 'Location')}${flag(has.cancel, 'Cancel date/time')}${flag(has.booked, 'Created date')}</div>
+     <div class="row" style="margin:6px 0">${flag(true, 'Date, time, provider, event, status')}${flag(has.dur, 'Duration / end time')}${flag(has.loc, 'Location')}${flag(has.cancel, 'Cancel date/time')}${flag(has.booked, 'Created date')}${flag(has.pt || has.mrn, 'Patient (Pat Name, Md Rc)')}</div>
      ${has.cancel && has.booked ? '' : `<div class="msg info">Add <b>${[!has.cancel && 'Cancel Date and Cancel Time', !has.booked && 'Created Date (when the visit was booked)'].filter(Boolean).join('</b> and <b>')}</b> to the NextGen report. ${!has.cancel ? 'Cancel date/time is what separates late cancels from early ones. ' : ''}${!has.booked ? 'Created date gives lead time and lets the tool rebuild 3NA for past weeks.' : ''}</div>`}`}
     <div class="row"><label class="btn primary">Import NextGen report…<input type="file" accept=".xls,.xlsx,.csv" data-act="importAppts" hidden></label><span class="small muted">Replaces the Appointment List tab. Use the full date range you want to study plus the weeks ahead.</span></div></div>
   <div class="card"><h2>Provider templates<span class="sp"></span><button class="btn sm primary" data-act="newTemplate">New template tab</button></h2>
@@ -412,15 +509,19 @@ function vSetup(){
   <div class="card"><h2>Lookup tabs</h2>
     <table><tbody>
       <tr><td><b>${SHEETS.st}</b></td><td class="small">Slot type → Clinical or Blocked, and which visits it accepts (event class, service line or event; comma = any of, + = all of, * = anything).</td><td>${d.stExists ? flag(true, `${d.st.length} rows`) : flag(false, 'Using built-in defaults')}</td><td><button class="btn sm" data-act="cfgSt">${d.stExists ? 'Add missing types' : 'Create'}</button></td></tr>
-      <tr><td><b>${SHEETS.ref}</b></td><td class="small">NextGen event → event class, service line, and whether it counts (holds and reference rows don’t).</td><td>${d.refExists ? flag(!(R && R.unmapped.length), R && R.unmapped.length ? `${R.unmapped.length} events not listed` : `${d.ref.length} rows`) : flag(false, 'Missing')}</td><td><button class="btn sm" data-act="cfgRef">${d.refExists ? 'Add missing events' : 'Create'}</button></td></tr>
+      <tr><td><b>${SHEETS.ref}</b></td><td class="small">NextGen event → event class, service line, whether it counts (holds and reference rows don’t), and Role (Consult, Start, Treatment, Follow-up) for cadence and the funnel.</td><td>${d.refExists ? flag(!(R && R.unmapped.length), R && R.unmapped.length ? `${R.unmapped.length} events not listed` : `${d.ref.length} rows`) : flag(false, 'Missing')}</td><td><button class="btn sm" data-act="cfgRef">${d.refExists ? 'Add missing events' : 'Create'}</button></td></tr>
       <tr><td><b>${SHEETS.prov}</b></td><td class="small">NextGen provider → template label, credential, include. Leave Include blank to let the tool decide (people yes, chairs and rooms no).</td><td>${d.provExists ? flag(true, `${d.prov.length} rows`) : flag(false, 'Missing')}</td><td><button class="btn sm" data-act="cfgProv">${d.provExists ? 'Add missing providers' : 'Create'}</button></td></tr>
     </tbody></table>
     ${R && R.unknownTypes.length ? `<div class="msg warn">Slot types in templates but not on ${SHEETS.st}: ${R.unknownTypes.map(x => esc(x.type)).join(', ')}.</div>` : ''}</div>
   <div class="cols"><div class="card"><h2>Settings</h2>
     <div class="fld">Late cancel window (hours before the visit)<input type="number" min="1" max="168" data-o="lateHours" value="${esc(S.opts.lateHours)}"></div>
     <div class="fld">3NA target (days)<input type="number" min="1" max="120" data-o="target" value="${esc(S.opts.target)}"></div>
-    <div class="fld">As-of date (blank = report run time)<input type="date" data-o="asOf" value="${esc(S.opts.asOf)}"></div></div>
-  <div class="card"><h2>Share results</h2><div class="small muted">Writes summary tabs (prefixed “TA ”) with the current filters. Counts only, no patient fields. Safe to share with anyone who can open this workbook.</div>
+    <div class="fld">As-of date (blank = report run time)<input type="date" data-o="asOf" value="${esc(S.opts.asOf)}"></div>
+    <h3>Cadence and recall</h3>
+    <div class="row"><div class="fld" style="flex:1">Release window (business hours)<input type="number" min="1" max="120" data-o="releaseHours" value="${esc(S.opts.releaseHours)}"></div><div class="fld" style="flex:1">Business day starts<input type="time" data-o="dayStart" value="${esc(S.opts.dayStart)}"></div><div class="fld" style="flex:1">Business day ends<input type="time" data-o="dayEnd" value="${esc(S.opts.dayEnd)}"></div></div>
+    <div class="row"><div class="fld" style="flex:1">Overdue after (× usual interval)<input type="number" min="1" max="5" step="0.1" data-o="overdueMult" value="${esc(S.opts.overdueMult)}"></div><div class="fld" style="flex:1">Lapsed after (days)<input type="number" min="7" max="730" data-o="lapsedDays" value="${esc(S.opts.lapsedDays)}"></div><div class="fld" style="flex:1">Match horizon (business days)<input type="number" min="1" max="60" data-o="matchDays" value="${esc(S.opts.matchDays)}"></div></div>
+    <div class="row"><div class="fld" style="flex:1">Consult converts within (days)<input type="number" min="7" max="365" data-o="convDays" value="${esc(S.opts.convDays)}"></div><div class="fld" style="flex:1">TMS course (treatments)<input type="number" min="1" max="60" data-o="tmsCount" value="${esc(S.opts.tmsCount)}"></div><div class="fld" style="flex:1">Maintenance after (days)<input type="number" min="30" max="730" data-o="maintDays" value="${esc(S.opts.maintDays)}"></div></div></div>
+  <div class="card"><h2>Share results</h2><div class="small muted">Writes summary tabs (prefixed “TA ”) with the current filters. Counts only, no patient fields. Safe to share with anyone who can open this workbook. Recall → Write patient tabs writes the “PT ” tabs, which list patients by LASFIR code.</div>
     <div class="row" style="margin-top:8px"><button class="btn primary" data-act="writeReports">Write report tabs</button><button class="btn" data-act="snapshot">Save 3NA snapshot</button></div>
     <h3>ESK access model</h3><div class="small muted">Import the export from the ESK Tracker’s Access tab (Export for template tool). Only the summary tabs are read; patient tabs in that file are ignored.</div>
     <div class="row" style="margin-top:6px"><label class="btn">Import access model…<input type="file" accept=".xlsx" data-act="importEsk" hidden></label>${S.esk ? `<span class="small muted">Loaded: ${esc(S.esk.modality)} · ${esc(S.esk.clinic)} · ${esc(String(S.esk.generated).slice(0, 10))}</span>` : ''}</div></div></div>`;
@@ -431,7 +532,7 @@ function render(){
   if (S.err) { $('#app').innerHTML = `<main><div class="card"><h2>Can’t read the workbook</h2><div class="msg bad">${esc(S.err)}</div><button class="btn primary" data-act="refresh">Try again</button></div></main>`; return; }
   if (!S.data) return;
   const ready = !!S.R; const view = ready ? S.view : 'setup';
-  const body = { overview: vOverview, templates: vTemplates, access: vAccess, visits: vVisits, impact: vImpact, trends: vTrends, setup: vSetup }[view]();
+  const body = { overview: vOverview, templates: vTemplates, access: vAccess, cadence: vCadence, funnel: vFunnel, recall: vRecall, visits: vVisits, impact: vImpact, trends: vTrends, setup: vSetup }[view]();
   $('#app').innerHTML = `<header class="top"><div class="bar"><div class="brand"><span class="dot">CT</span><span>Clinic Template Tool</span><small>${S.R ? `${S.R.tByProv.size} templates · ${num(S.data.ap.rows.length)} visits` : ''}</small></div>
     <button class="iconbtn" data-act="refresh" title="Re-read the workbook" aria-label="Refresh">⟳</button>
     ${S.mode === 'pane' && S.canFull ? `<button class="iconbtn" data-act="full" title="Full screen" aria-label="Full screen">⛶</button>` : ''}${S.mode === 'dialog' ? `<button class="iconbtn" data-act="closeFull" title="Close full screen" aria-label="Close full screen">✕</button>` : ''}</div>
@@ -457,6 +558,8 @@ document.addEventListener('click', async e => {
     else if (act === 'writeReports') await writeReports();
     else if (act === 'snapshot') await saveSnapshot();
     else if (act === 'dlManifest') downloadManifest();
+    else if (act === 'copyOutreach') await copyOutreach();
+    else if (act === 'writePatients') await writePatientTabs();
   } catch (err){ console.error(err); busy(false); toast('bad', esc(err.message || String(err)), 9000); }
 });
 document.addEventListener('change', async e => {
@@ -468,6 +571,8 @@ document.addEventListener('change', async e => {
     if (act === 'heatMetric'){ S.heatMetric = t.value; render(); }
     else if (act === 'trendType'){ S.trendType = t.value; render(); }
     else if (act === 'impactWhy'){ S.impactWhy = t.value; render(); }
+    else if (act === 'recallState'){ S.recallState = t.value; render(); }
+    else if (act === 'importEskStatus' && t.files[0]) await importEskStatus(t.files[0]);
     else if (act === 'importAppts' && t.files[0]) await importAppts(t.files[0]);
     else if (act === 'importEsk' && t.files[0]) await importEsk(t.files[0]);
     else if (act === 'tplCopy') fillTemplateDefaults();
@@ -515,13 +620,14 @@ async function writeSlotTypes(){
   toast('ok', `${SHEETS.st} tab has ${base.length} slot types.`); await reload();
 }
 async function writeRef(){
-  const R = S.R; const rows = S.data.ref.map(r => [r.event, r.resType, r.sched, r.cls, r.sl, r.elig]);
+  const R = S.R; const roleGuess = r => { const c = TE.classify(TE.buildRef([r]), r.event); return c.kind === 'pt' ? ROLE_LABEL[c.role] : ''; };
+  const rows = S.data.ref.map(r => [r.event, r.resType, r.sched, r.cls, r.sl, r.elig, r.role || roleGuess(r)]);
   const seen = new Set(rows.map(r => String(r[0]).toLowerCase()));
   const events = S.data.ap && !S.data.ap.error ? [...new Set(S.data.ap.rows.map(a => a.event).filter(Boolean))] : [];
   let added = 0;
-  for (const ev of events.sort()) if (!seen.has(ev.toLowerCase())){ const g = TE.classify(new Map(), ev); rows.push([ev, 'Provider', g.kind === 'ignore' ? 'Reference/Hold Only' : g.kind === 'nonpt' ? 'Admin' : 'Clinical', g.cls, g.sl, g.kind === 'ignore' ? 'No' : 'Always']); added++; }
-  busy(true, 'Writing Ref…'); await S.store.writeSheet(SHEETS.ref, [['Event', 'Resource Type', 'Schedule Classification', 'Event Class', 'Service Line', 'Template Eligible']].concat(rows), { keepFormat: true }); busy(false);
-  toast('ok', added ? `Added ${added} events to ${SHEETS.ref}. Check their Event Class and Service Line.` : `${SHEETS.ref} already lists every event.`); await reload();
+  for (const ev of events.sort()) if (!seen.has(ev.toLowerCase())){ const g = TE.classify(new Map(), ev); rows.push([ev, 'Provider', g.kind === 'ignore' ? 'Reference/Hold Only' : g.kind === 'nonpt' ? 'Admin' : 'Clinical', g.cls, g.sl, g.kind === 'ignore' ? 'No' : 'Always', g.kind === 'pt' ? ROLE_LABEL[g.role] : '']); added++; }
+  busy(true, 'Writing Ref…'); await S.store.writeSheet(SHEETS.ref, [['Event', 'Resource Type', 'Schedule Classification', 'Event Class', 'Service Line', 'Template Eligible', 'Role']].concat(rows), { keepFormat: true }); busy(false);
+  toast('ok', added ? `Added ${added} events to ${SHEETS.ref}. Check their Event Class, Service Line and Role.` : `${SHEETS.ref} already lists every event.`); await reload();
 }
 async function writeProviders(){
   const R = S.R; const rows = S.data.prov.map(p => [p.name, p.label, p.cred, p.include ?? '']);
@@ -589,7 +695,7 @@ async function writeReports(){
   const t = R.total; pr.push(['All', '', '', t.supply, P(t.fill), P(t.util), P(t.fit), t.open, t.admin, t.pto, t.aAll, t.aKept, P(t.nsRate), P(t.cxRate), R.hasLate ? P(t.lcRate) : '', t.inBlocked, t.offTemplate, t.dbl, P(t.futFill), scope]);
   const pc = c => Object.fromEntries(c.map(i => [i, '0.0%']));
   await S.store.writeSheet('TA Summary', [provH].concat(pr), { numFmt: pc([4, 5, 6, 12, 13, 14, 18]) });
-  await S.store.writeSheet('TA Slot Types', [['Slot type', 'Slots', 'Filled %', 'Template fit %', 'Kept as intended', 'Kept, other visit', 'No-show', 'Open', 'To admin', 'PTO', 'Booked ahead %', 'Most common other visits']].concat(R.byType.filter(r => r.supply || r.futSupply).sort((a, b) => b.supply - a.supply).map(r => [r.key, r.supply, P(r.fill), P(r.fit), r.keptFit, r.keptOff, r.ns, r.open, r.admin, r.pto, P(r.futFill), Object.entries(R.offMix[r.key] || {}).sort((a, b) => b[1] - a[1]).slice(0, 3).map(x => `${x[0]} (${x[1]})`).join(', ')])), { numFmt: pc([2, 3, 10]) });
+  await S.store.writeSheet('TA Slot Types', [['Slot type', 'Slots', 'Filled %', 'Template fit %', 'Kept as intended', 'Kept, other visit', 'No-show', 'Open', 'To admin', 'PTO', 'Booked ahead %', 'Most common other visits', 'Kept, release booking']].concat(R.byType.filter(r => r.supply || r.futSupply).sort((a, b) => b.supply - a.supply).map(r => [r.key, r.supply, P(r.fill), P(r.fit), r.keptFit, r.keptOff, r.ns, r.open, r.admin, r.pto, P(r.futFill), Object.entries(R.offMix[r.key] || {}).sort((a, b) => b[1] - a[1]).slice(0, 3).map(x => `${x[0]} (${x[1]})`).join(', '), r.keptRel])), { numFmt: pc([2, 3, 10]) });
   const vr = (dim, rows) => rows.filter(r => r.aAll).sort((a, b) => b.aAll - a.aAll).map(r => [dim, r.key, r.aAll, r.aKept, r.aNS, r.aCx, P(r.nsRate), P(r.cxRate), R.hasLate ? P(r.lcRate) : '', r.leadMed == null ? '' : r.leadMed]);
   await S.store.writeSheet('TA Visit Types', [['Group', 'Value', 'Visits', 'Kept', 'No-show', 'Cancelled', 'No-show %', 'Cancel %', 'Late cancel %', 'Median lead days']].concat(vr('Service line', R.bySL), vr('Event class', R.byClass), vr('Event', R.byEvent), vr('Day', R.byDow), vr('Hour', R.byHour.filter(h => typeof h.key === 'number').map(h => Object.assign({}, h, { key: TE.hourLabel(h.key) })))), { numFmt: pc([6, 7, 8]) });
   await S.store.writeSheet('TA Weekly', [['Week of (Sun)', 'Clinical slots', 'Filled %', 'Template fit %', 'Visits', 'Kept', 'No-show %', 'Cancel %', 'Late cancel %', 'Visits outside template', 'Future template slots', 'Booked ahead %']].concat(R.byWeek.map(w => [w.key, w.supply, P(w.fill), P(w.fit), w.aAll, w.aKept, P(w.nsRate), P(w.cxRate), R.hasLate ? P(w.lcRate) : '', w.inBlocked + w.offTemplate, w.futSupply, P(w.futFill)])), { numFmt: Object.assign({ 0: 'm/d/yyyy' }, pc([2, 3, 6, 7, 8, 11])) });
@@ -597,7 +703,57 @@ async function writeReports(){
   await S.store.writeSheet('TA Heatmap', [['Filled % by day and hour'].concat(hours.map(TE.hourLabel))].concat([1, 2, 3, 4, 5].map(d => [TE.DAYS[d]].concat(hours.map(h => { const c = H.get(d + '|' + h); return c && c.supply ? P(c.fill) : ''; })))), { numFmt: Object.fromEntries(hours.map((h, i) => [i + 1, '0%'])) });
   await S.store.writeSheet('TA 3NA', [['As of', 'Provider', 'Slot type', 'Next available (days)', '3NA (days)', 'Open slots ahead', 'Third open slot']].concat(R.threeNa.map(x => [R.asOf, x.prov, x.type, x.next ?? '', x.third ?? '', x.open, x.thirdDate ?? ''])), { numFmt: { 0: 'm/d/yyyy', 6: 'm/d/yyyy' } });
   await S.store.writeSheet('TA Exceptions', [['Date', 'Time', 'Provider', 'Event', 'Status', 'Why', 'Minutes outside template']].concat(R.exceptions.map(e => [e.date, TE.hhmm(e.time), e.prov, e.event, e.status, e.why, e.min])), { numFmt: { 0: 'm/d/yyyy' } });
-  busy(false); toast('ok', 'Wrote TA Summary, TA Slot Types, TA Visit Types, TA Weekly, TA Heatmap, TA 3NA and TA Exceptions.');
+  const C = S.C; let extra = '';
+  if (C){
+    await S.store.writeSheet('TA Cadence', [['Provider', 'Service line', 'Patients', 'Kept visits', 'Visits per patient', 'Returning patients', 'Mean gap (days)', 'Median gap (days)', 'Mode (wks)', 'Mode share', 'No-shows', 'Cancels', 'No-show %'].concat(C.cad.hist, ['Scope'])].concat(C.cad.rows.map(r => [r.prov, r.bucket, r.patients, r.kept, P(r.perPt), r.returning, P(r.mean), r.median ?? '', r.modeWk ?? '', P(r.modeShare), r.ns, r.cx, P(r.nsRate)].concat(r.hist, [scope]))), { numFmt: pc([9, 12]) });
+    await S.store.writeSheet('TA Funnel', [['Provider', 'Service line', 'Consult slots', 'Consult hours', 'Consults kept', 'Consult fill %', 'Started', 'Pending', 'Conversion %', 'Median days to start', 'Start visit (min)', 'Start hours offered', 'Start hours used', 'Start hours needed', 'Offered vs needed', 'Scope']].concat(C.fun.map(r => [r.prov, r.sl, r.consultSlots, P(r.consultHours), r.consults, P(r.consultFill), r.converted, r.pending, P(r.rate), r.medDays ?? '', r.startLen, P(r.startHoursOffered), P(r.startHoursUsed), P(r.startHoursNeeded), r.flag, scope])), { numFmt: pc([5, 8]) });
+    await S.store.writeSheet('TA Flex Usage', [['Provider', 'Slot type', 'Accepts', 'Offered', 'Used', 'Use %', 'Consult', 'Start', 'Treatment', 'Follow-up', 'Release bookings', 'Release share', 'Scope']].concat(C.flex.map(r => [r.prov, r.type, r.accepts.map(x => ROLE_LABEL[x]).join(', ') || 'Anything', r.offered, r.used, P(r.useRate), r.roles.consult || 0, r.roles.start || 0, r.roles.treatment || 0, r.roles.followup || 0, r.release, P(r.releaseShare), scope])), { numFmt: pc([5, 11]) });
+    extra = ', TA Cadence, TA Funnel, TA Flex Usage';
+  }
+  busy(false); toast('ok', `Wrote TA Summary, TA Slot Types, TA Visit Types, TA Weekly, TA Heatmap, TA 3NA, TA Exceptions${extra}.`);
+}
+// patient-level tabs: LASFIR codes only, never names or record numbers
+async function writePatientTabs(){
+  const C = S.C; if (!C) return;
+  if (!confirm('Write PT Recall, PT Slot Matches and PT Cadence Patients? They list patients by LASFIR code (no names or record numbers), so share this workbook only with people who may see patient-level schedules.')) return;
+  busy(true, 'Writing patient tabs…');
+  await S.store.writeSheet('PT Recall', [['As of', 'LASFIR', 'Provider', 'Service line', 'Clinic', 'Last seen', 'Days since', 'Usual interval (days)', 'State', 'Since last visit', 'Next booked', 'ESK Tracker', 'Return date', 'Pause reason']].concat(C.rc.map(r => [S.R.asOf, r.code || '(check name)', r.prov, r.bucket, r.loc, r.last, r.daysSince, r.exp ?? '', (STATE[r.state] || [0, r.state])[1], r.post, r.next ?? '', r.tracker, r.ret ?? '', r.reason])), { numFmt: { 0: 'm/d/yyyy', 5: 'm/d/yyyy', 10: 'm/d/yyyy', 12: 'm/d/yyyy' } });
+  await S.store.writeSheet('PT Slot Matches', [['LASFIR', 'Service line', 'State', 'Usual provider', 'Slot provider', 'Slot date', 'Slot time', 'Slot type', 'Why it fits']].concat(C.matches.map(x => [x.code || '(check name)', x.bucket, (STATE[x.state] || [0, x.state])[1], x.patientProv, x.prov, x.date, TE.hhmm(x.min), x.type, x.why])), { numFmt: { 5: 'm/d/yyyy' } });
+  await S.store.writeSheet('PT Cadence Patients', [['LASFIR', 'Provider', 'Service line', 'Kept visits', 'First seen', 'Last seen', 'Mean gap (days)', 'Last gap (days)', 'Tele %']].concat(C.cad.patients.map(p => [p.code || '(check name)', p.prov, p.bucket, p.kept, p.first, p.last, p.meanGap == null ? '' : Math.round(p.meanGap * 10) / 10, p.lastGap ?? '', p.telePct == null ? '' : Math.round(p.telePct * 1000) / 1000])), { numFmt: { 4: 'm/d/yyyy', 5: 'm/d/yyyy', 8: '0%' } });
+  busy(false); toast('ok', 'Wrote PT Recall, PT Slot Matches and PT Cadence Patients.');
+}
+// the call list grouped by clinic, as a table to paste into an email or Teams (LASFIR only, like the Confirmations tool)
+async function copyOutreach(){
+  const C = S.C; if (!C) return;
+  const list = (S.recallState === 'call' ? C.rc.filter(r => TC.CALL.has(r.state)) : S.recallState ? C.rc.filter(r => r.state === S.recallState) : C.rc);
+  if (!list.length){ toast('warn', 'Nobody on this list.'); return; }
+  const first = new Map(); for (const x of C.matches){ const k = x.code + '|' + x.bucket; if (!first.has(k)) first.set(k, x); }
+  const cols = [['Pat Name', r => r.code || '(check name)'], ['Service line', r => r.bucket], ['Provider', r => r.prov], ['Last seen', r => TE.mdy(r.last)], ['Days since', r => r.daysSince], ['Usual interval', r => r.exp == null ? '' : r.exp + ' d'], ['State', r => (STATE[r.state] || [0, r.state])[1]], ['Since last visit', r => r.post], ['ESK Tracker', r => r.tracker], ['First open slot', r => { const m = first.get(r.code + '|' + r.bucket); return m ? `${TE.mdy(m.date)} ${TE.hhmm(m.min)} ${m.type} (${m.prov.split(',')[0]})` : ''; }]];
+  const groups = new Map(); for (const r of list){ const k = r.loc || 'No location'; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(r); }
+  const th = 'style="background:#1f4e79;color:#fff;text-align:left;padding:6px 8px;font-family:Aptos Display,Aptos,Calibri,Arial,sans-serif;border:1px solid #ccc;font-size:12px"';
+  const td = 'style="padding:6px 8px;font-family:Aptos Display,Aptos,Calibri,Arial,sans-serif;border:1px solid #ccc;font-size:12px;vertical-align:top"';
+  let html = '', text = '';
+  for (const [loc, rows] of [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]))){
+    html += `<p style="margin:14px 0 6px;font-family:Aptos,Calibri,Arial,sans-serif"><b>${esc(loc)}</b> (${rows.length})</p><table style="border-collapse:collapse"><tr>${cols.map(c => `<th ${th}>${esc(c[0])}</th>`).join('')}</tr>${rows.map(r => `<tr>${cols.map(c => `<td ${td}>${esc(c[1](r))}</td>`).join('')}</tr>`).join('')}</table>`;
+    text += `${loc} (${rows.length})\n${cols.map(c => c[0]).join('\t')}\n${rows.map(r => cols.map(c => c[1](r)).join('\t')).join('\n')}\n\n`;
+  }
+  const done = () => toast('ok', `Copied ${list.length} patients in ${groups.size} clinic${groups.size === 1 ? '' : 's'}.`);
+  try { if (navigator.clipboard && window.ClipboardItem){ await navigator.clipboard.write([new ClipboardItem({ 'text/html': new Blob([html], { type: 'text/html' }), 'text/plain': new Blob([text], { type: 'text/plain' }) })]); done(); return; } } catch {}
+  // the clipboard API is often blocked inside Office: select a hidden copy of the table and use the copy command
+  const box = document.createElement('div'); box.contentEditable = 'true'; box.style.cssText = 'position:fixed;left:-9999px;top:0'; box.innerHTML = html; document.body.appendChild(box);
+  const rg = document.createRange(); rg.selectNodeContents(box); const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(rg);
+  let ok = false; try { ok = document.execCommand('copy'); } catch {}
+  sel.removeAllRanges(); box.remove();
+  if (ok) done(); else toast('bad', 'Couldn’t copy here. Use Write patient tabs and copy from PT Recall instead.', 9000);
+}
+async function importEskStatus(file){
+  const wb = await readFileAoa(file);
+  const aoa = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, raw: true, defval: '' });
+  const r = TC.readEskStatus(aoa); if (r.error) throw new Error(r.error);
+  busy(true, 'Saving ESK Tracker status…');
+  await S.store.writeSheet(SHEETS.eskst, [['LASFIR', 'Clinic', 'Status', 'Last Dose Date', 'Pause Reason', 'Expected Return Date']].concat(r.rows.map(x => [x.code, x.clinic, x.status, x.lastDose ?? '', x.reason, x.ret ?? ''])), { numFmt: { 3: 'm/d/yyyy', 5: 'm/d/yyyy' } });
+  await S.store.setDoc('ctEskAt', TE.todaySerial());
+  busy(false); toast('ok', `Loaded ESK Tracker status for ${r.rows.length} patients${r.skipped ? ` (${r.skipped} rows without a LASFIR code skipped)` : ''}.`); await reload();
 }
 async function saveSnapshot(){
   const R = S.R; if (!R) return;
