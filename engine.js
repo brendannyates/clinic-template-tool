@@ -273,6 +273,7 @@
     cancelTime: /^(cancel(l)?(ed)?\s*time|cxl\s*time)$/i,
     reason: /^(cancel(l)?(ation)?\s*reason|reason|cxl\s*reason|cancel\s*code)$/i,
     pt: /^((pat\.?|patient|pt\.?|person)\s*name|patient)$/i,
+    payer: /^(payer\s*name(\s*\(cht\s*guar\))?|primary\s*(payer|insurance)|payer|insurance)$/i,
     mrn: /^(md\s*rc|med\.?\s*rec(\.|ord)?\s*(nbr|no\.?|#|number)?|mrn|person\s*(nbr|no\.?|#|number|id)|patient\s*(id|nbr|no\.?|#|number)|chart\s*(nbr|no\.?|#|number))$/i,
   };
   function findHeader(values){
@@ -306,11 +307,11 @@
       if (booked != null && c.bookedTime != null){ const t = parseTime(v[c.bookedTime]); if (t != null) booked = Math.floor(booked) + t / 1440; }
       let cancelAt = c.cancel != null ? parseDateTime(v[c.cancel]) : null;
       if (cancelAt != null && c.cancelTime != null){ const t = parseTime(v[c.cancelTime]); if (t != null) cancelAt = Math.floor(cancelAt) + t / 1440; }
-      rows.push({ date, start, dur, prov: txt(v[c.prov]), event: txt(v[c.event]), status: normStatus(v[c.status]), rawStatus: txt(v[c.status]), loc: c.loc != null ? txt(v[c.loc]) : '', booked, cancelAt, reason: c.reason != null ? txt(v[c.reason]) : '', pt: c.pt != null ? txt(v[c.pt]) : '', mrn: c.mrn != null ? txt(v[c.mrn]) : '' });
+      rows.push({ date, start, dur, prov: txt(v[c.prov]), event: txt(v[c.event]), status: normStatus(v[c.status]), rawStatus: txt(v[c.status]), loc: c.loc != null ? txt(v[c.loc]) : '', booked, cancelAt, reason: c.reason != null ? txt(v[c.reason]) : '', pt: c.pt != null ? txt(v[c.pt]) : '', mrn: c.mrn != null ? txt(v[c.mrn]) : '', payer: c.payer != null ? txt(v[c.payer]) : '' });
     }
     const dates = rows.map(x => x.date);
     return { rows, header: h, runAt: findRunDate(values, h.row), skipped, min: dates.length ? Math.min(...dates) : null, max: dates.length ? Math.max(...dates) : null,
-      has: { booked: c.booked != null, cancel: c.cancel != null, reason: c.reason != null, dur: c.dur != null || c.end != null, loc: c.loc != null, pt: c.pt != null, mrn: c.mrn != null } };
+      has: { booked: c.booked != null, cancel: c.cancel != null, reason: c.reason != null, dur: c.dur != null || c.end != null, loc: c.loc != null, pt: c.pt != null, mrn: c.mrn != null, payer: c.payer != null } };
   }
 
   // ---------- analysis ----------
