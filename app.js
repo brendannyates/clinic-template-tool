@@ -15,7 +15,15 @@ const S = { view: 'overview', data: null, R: null, f: { from: '', to: '', loc: '
 function toast(kind, html, ms = 5000){ const d = document.createElement('div'); d.className = 'msg ' + kind; d.innerHTML = html; $('#toast').appendChild(d); setTimeout(() => d.remove(), ms); }
 function busy(on, msg){ $('#busy').hidden = !on; if (msg) $('#busyMsg').textContent = msg; }
 function openModal(html){ $('#sheet').innerHTML = html; $('#modal').hidden = false; }
-function closeModal(){ $('#modal').hidden = true; $('#sheet').innerHTML = ''; }
+function closeModal(){ $('#modal').hidden = true; $('#sheet').innerHTML = ''; const r = askRes; askRes = null; if (r) r(false); }
+// Office add-ins block window.confirm, so yes/no questions use the in-pane modal. Closing it any other way = Cancel.
+let askRes = null;
+function ask(html, ok = 'Continue'){
+  return new Promise(res => {
+    openModal(`<h2>Please confirm</h2><div>${html}</div><div class="row" style="margin-top:12px"><button class="btn primary" data-act="askYes">${esc(ok)}</button><button class="btn" data-act="askNo">Cancel</button></div>`);
+    askRes = res;
+  });
+}
 $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#modal').hidden) closeModal(); });
 
@@ -580,7 +588,8 @@ document.addEventListener('click', async e => {
     else if (act === 'closeFull') S.store.close();
     else if (act === 'newTemplate') newTemplateDialog();
     else if (act === 'makeTemplate') await makeTemplate();
-    else if (act === 'close') closeModal();
+    else if (act === 'close' || act === 'askNo') closeModal();
+    else if (act === 'askYes'){ const r = askRes; askRes = null; closeModal(); if (r) r(true); }
     else if (act === 'cfgSt') await writeSlotTypes();
     else if (act === 'cfgRef') await writeRef();
     else if (act === 'cfgProv') await writeProviders();
@@ -627,7 +636,7 @@ async function importAppts(file){
   const W = Math.max(...best.aoa.map(r => r.length)); const keepC = []; for (let c = 0; c < W; c++) if (best.aoa.some(r => String(r[c] ?? '').trim())) keepC.push(c);
   const aoa = best.aoa.map(r => keepC.map(c => r[c] ?? ''));
   const parsed = TE.parseAppts(aoa);
-  if (!confirm(`Replace the ${S.data.ap ? `“${S.data.ap.sheet}”` : 'Appointment List'} tab with ${parsed.rows.length.toLocaleString()} visits (${TE.mdy(parsed.min)} – ${TE.mdy(parsed.max)})?`)) return;
+  if (!(await ask(`Replace the <b>${esc(S.data.ap ? S.data.ap.sheet : SHEETS.appt)}</b> tab with ${parsed.rows.length.toLocaleString()} visits (${TE.mdy(parsed.min)} – ${TE.mdy(parsed.max)})?`, 'Replace'))) return;
   busy(true, `Writing ${parsed.rows.length.toLocaleString()} visits…`);
   await S.store.replaceAppts(S.data.ap ? S.data.ap.sheet : SHEETS.appt, aoa, keepC.indexOf(best.h.cols.date) >= 0 ? keepC.indexOf(best.h.cols.date) : null);
   busy(false); toast('ok', 'Appointment list updated.'); await reload();
@@ -749,7 +758,7 @@ async function writeReports(){
 // patient-level tabs: LASFIR codes only, never names or record numbers
 async function writePatientTabs(){
   const C = S.C; if (!C) return;
-  if (!confirm('Write PT Recall, PT Slot Matches and PT Cadence Patients? They list patients by LASFIR code (no names or record numbers), so share this workbook only with people who may see patient-level schedules.')) return;
+  if (!(await ask('Write PT Recall, PT Slot Matches and PT Cadence Patients? They list patients by LASFIR code (no names or record numbers), so share this workbook only with people who may see patient-level schedules.', 'Write tabs'))) return;
   busy(true, 'Writing patient tabs…');
   await S.store.writeSheet('PT Recall', [['As of', 'LASFIR', 'Provider', 'Service line', 'Clinic', 'Last seen', 'Days since', 'Usual interval (days)', 'State', 'Since last visit', 'Next booked', 'ESK Tracker', 'Return date', 'Pause reason']].concat(C.rc.map(r => [S.R.asOf, r.code || '(check name)', r.prov, r.bucket, r.loc, r.last, r.daysSince, r.exp ?? '', (STATE[r.state] || [0, r.state])[1], r.post, r.next ?? '', r.tracker, r.ret ?? '', r.reason])), { numFmt: { 0: 'm/d/yyyy', 5: 'm/d/yyyy', 10: 'm/d/yyyy', 12: 'm/d/yyyy' } });
   await S.store.writeSheet('PT Slot Matches', [['LASFIR', 'Service line', 'State', 'Usual provider', 'Slot provider', 'Slot date', 'Slot time', 'Slot type', 'Why it fits']].concat(C.matches.map(x => [x.code || '(check name)', x.bucket, (STATE[x.state] || [0, x.state])[1], x.patientProv, x.prov, x.date, TE.hhmm(x.min), x.type, x.why])), { numFmt: { 5: 'm/d/yyyy' } });
@@ -793,7 +802,7 @@ async function importPayerRules(file){
   const wb = await readFileAoa(file);
   const aoa = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, raw: false, defval: '' });
   const r = PayerRules.read(aoa); if (r.error) throw new Error(r.error);
-  if (S.data.payerRules && !S.data.payerRules.error && !confirm(`Replace the ${SHEETS.pcr} tab (${S.data.payerRules.rules.length} rows) with this file (${r.rules.length} rows)? Edits made on the tab will be lost.`)) return;
+  if (S.data.payerRules && !S.data.payerRules.error && !(await ask(`Replace the <b>${esc(SHEETS.pcr)}</b> tab (${S.data.payerRules.rules.length} rows) with this file (${r.rules.length} rows)? Edits made on the tab will be lost.`, 'Replace'))) return;
   busy(true, 'Saving payer rules…');
   await S.store.writeSheet(SHEETS.pcr, PayerRules.toRows(r.rules));
   busy(false); toast('ok', `Loaded ${r.rules.length} payer rules${r.skipped ? ` (${r.skipped} rows without MD or NP skipped)` : ''}.`); await reload();
