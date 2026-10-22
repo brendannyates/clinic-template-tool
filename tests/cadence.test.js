@@ -168,6 +168,38 @@ test('release window list and open-slot matches for the call list', () => {
   assert.ok(tms.some(x => x.why === 'released' && x.type === 'Interventional Consult'));
 });
 
+test('ESK visits are checked against the payer credential rules', () => {
+  const PR = require('../payer-rules.js');
+  const { rules } = PR.read([['Payer', 'State', 'Credential', 'Besse Approved', 'NP Fully Approved', 'Esketamine First Treatment', 'Esketamine Start', 'Esketamine Observation', 'Match Names', 'Notes'],
+    ['Zenith CA', 'CA', 'NP', 'N', 'No', 'No', 'No', 'No', 'zenith'], ['Zenith CA', 'CA', 'MD', 'N', 'N/A', 'Yes', 'Yes', 'Yes', 'zenith'],
+    ['Zenith WA', 'WA', 'NP', 'N', 'Yes', 'Yes', 'Yes', 'Yes', 'zenith'], ['Zenith WA', 'WA', 'MD', 'N', 'N/A', 'Yes', 'Yes', 'Yes', 'zenith'],
+    ['Orbit', '', 'NP', 'Y', 'No', 'No', 'No', 'Yes', 'orbit', 'NP may do observation only'], ['Orbit', '', 'MD', 'Y', 'N/A', 'Yes', 'Yes', 'Yes', 'orbit']]);
+  const NP = 'Okafor PMHNP, Jordan', MD = 'Smith MD, Jane';
+  const e = (date, prov, event, payer, loc, status = 'Expected') => ({ date, start: 660, dur: 30, prov, event, status, rawStatus: status, loc, payer, pt: 'Doe, Alex', mrn: '1' });
+  const appts = [
+    e(ASOF + 1, NP, 'Esketamine Follow Up', 'Zenith Blue', 'Castro - CA'),        // CA: NP can't
+    e(ASOF + 1, NP, 'Esketamine Follow Up', 'Zenith Blue', 'Seattle - WA'),       // WA: NP can
+    e(ASOF + 2, NP, 'Esketamine Follow Up', 'Zenith Blue', 'Eastside'),           // state unknown, rules disagree
+    e(ASOF + 2, NP, 'Esketamine Follow Up', 'Orbit Federal', 'Eastside'),         // observation: NP ok
+    e(ASOF + 3, NP, 'Esketamine Start', 'Orbit Federal', 'Eastside'),             // start: NP can't
+    e(ASOF + 3, MD, 'Esketamine Start', 'Orbit Federal', 'Eastside'),
+    e(ASOF + 3, NP, 'Esketamine Start', 'Orbit Federal', 'Eastside', 'Cancelled'),
+    e(ASOF + 4, NP, 'Med Management Telepsych', 'Zenith Blue', 'Castro - CA'),    // not ESK
+    e(ASOF + 4, 'Eastside ESK 1', 'Esketamine Follow Up', 'Zenith Blue', 'Castro - CA'),   // chair: no credential
+    e(ASOF - 10, NP, 'Esketamine Follow Up', 'Zenith Blue', 'Castro - CA', 'Kept'),        // past: billing risk
+  ];
+  const P = TC.eskCredentials(appts, REF, rules, PR, n => TE.credentialOf(n), new Set([NP, MD]), { asOf: ASOF, from: ASOF - 30, to: ASOF });
+  assert.equal(P.rows.length, 7);
+  assert.deepEqual(P.upcoming.map(r => [r.date - ASOF, r.event, r.rule]), [[1, 'Esketamine Follow Up', 'Zenith CA'], [3, 'Esketamine Start', 'Orbit']]);
+  assert.match(P.upcoming[1].why, /NP may do observation only/);
+  assert.equal(P.unclear.length, 1); assert.equal(P.past.length, 1); assert.equal(P.upcoming[0].code, 'DOEALE');
+  const orbit = P.byPayer.find(g => g.rule === 'Orbit');
+  assert.equal(orbit.npSteps, 'observation only'); assert.equal(orbit.besse, 'approved'); assert.equal(orbit.md, 1); assert.equal(orbit.np, 2);
+  assert.equal(P.byPayer.find(g => g.rule === 'Zenith CA').npSteps, 'None');
+  assert.equal(P.byPayer.find(g => g.rule === 'Zenith WA').npSteps, 'All visits');
+  assert.ok(TE.parseAppts([['Appt Date', 'Rendering', 'Event', 'Status', 'Payer Name (Cht Guar)'], ['3/2/2026', MD, 'x', 'Kept', 'Orbit']]).has.payer);
+});
+
 test('ESK status import refuses names', () => {
   assert.ok(TC.readEskStatus([['LASFIR', 'Status'], ['Doe, Alex', 'Active']]).error);
   assert.ok(TC.readEskStatus([['Name', 'Thing']]).error);

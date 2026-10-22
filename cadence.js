@@ -255,6 +255,45 @@
     return rows.sort((a, b) => a.prov.localeCompare(b.prov) || b.consults - a.consults);
   }
 
+  // ---------- esketamine payer credential rules ----------
+  // Every ESK visit booked on a provider (not a chair), checked against the Payer Credential Rules sheet: may this
+  // provider's credential bill this visit for the patient's payer? Upcoming ones can still be moved; past ones are billing
+  // risk. The NextGen list can't tell a first treatment from later dosing, so only an event named "first" counts as one.
+  // PR = the PayerRules module, rules = PR.read(sheet).rules, cred(prov) -> 'MD' | 'NP' | ''. o: { asOf, from, to, provs, locs }
+  function eskCredentials(appts, ref, rules, PR, cred, people, o){
+    const refMap = TE.buildRef(ref); const memo = new Map(); const rows = [];
+    for (const a of appts || []){
+      if (!a.prov || !people.has(a.prov) || a.status === 'Cancelled') continue;
+      if (o.provs && !o.provs.has(a.prov)) continue;
+      if (o.locs && !o.locs.has(a.loc)) continue;
+      const future = a.date >= o.asOf;
+      if (!future && (a.date < o.from || a.date > o.to)) continue;
+      let c = memo.get(a.event); if (!c){ c = TE.classify(refMap, a.event); memo.set(a.event, c); }
+      if (c.kind !== 'pt' || !slTokens(c.sl).some(t => /^(esk|esketamine|spravato)$/i.test(t))) continue;
+      const step = PR.step(a.event, /\bfirst\b/i.test(a.event));
+      const cr = cred(a.prov), m = PR.match(rules, a.payer, a.loc), r = PR.check(m, cr, step);
+      rows.push({ date: a.date, start: a.start, prov: a.prov, cred: cr, event: a.event, status: a.status, loc: a.loc, payer: a.payer, rule: m ? m.payer : '',
+        ambiguous: !!(m && m.ambiguous.length), step, ok: r.ok, why: r.why, besse: PR.besse(m), code: TE.lasfir(a.pt), future, m });
+    }
+    rows.sort((x, y) => x.date - y.date || (x.start || 0) - (y.start || 0));
+    const byPayer = new Map();
+    for (const r of rows){
+      const k = (r.payer || '(no payer)') + '|' + r.rule; let g = byPayer.get(k);   // one payer name can fall under a CA and a WA rule
+      if (!g){ g = { payer: r.payer || '(no payer)', rule: r.rule, ambiguous: r.ambiguous, besse: r.besse, visits: 0, md: 0, np: 0, blocked: 0, upcomingBlocked: 0, m: r.m }; byPayer.set(k, g); }
+      g.visits++; if (r.cred === 'MD') g.md++; if (r.cred === 'NP') g.np++;
+      if (r.ok === false){ g.blocked++; if (r.future) g.upcomingBlocked++; }
+    }
+    // what an NP may do for each payer: every ESK step, observation only, or none
+    for (const g of byPayer.values()){
+      const m = g.m;   // the first visit's match, which used its clinic for the state
+      if (!m || m.ambiguous.length){ g.npSteps = m ? 'Depends on state' : ''; continue; }
+      const ok = ['first', 'start', 'obs'].filter(s => PR.check(m, 'NP', s).ok === true);
+      g.npSteps = !m.NP ? 'No NP row' : ok.length === 3 ? 'All visits' : ok.length === 0 ? 'None' : ok.map(s => PR.STEPS[s]).join(', ') + ' only';
+    }
+    return { rows, byPayer: [...byPayer.values()].sort((a, b) => b.visits - a.visits), upcoming: rows.filter(r => r.future && r.ok === false), past: rows.filter(r => !r.future && r.ok === false),
+      unclear: rows.filter(r => r.future && r.ok === null && r.ambiguous) };
+  }
+
   // ---------- ESK Tracker status import ----------
   // CSV or sheet with LASFIR, clinic, status, last dose date, pause reason, expected return date. Names are refused.
   const ESK_COLS = { code: /^(lasfir|patient\s*code|code|patient)$/i, clinic: /^(clinic|location|site)$/i, status: /^status$/i, lastDose: /^last\s*dose/i, reason: /reason/i, ret: /return/i };
@@ -277,5 +316,5 @@
     return { error: 'Couldn’t find LASFIR and Status columns. Use the ESK Tracker’s Export for Appointments file.' };
   }
 
-  return { DEFAULTS, HIST, CALL, visits, chains, gapStats, cadence, recall, samples, slotRoles, flexTypes, flexUsage, releaseList, slotMatches, funnel, readEskStatus, addBusinessDays };
+  return { DEFAULTS, HIST, CALL, visits, chains, gapStats, cadence, recall, samples, slotRoles, flexTypes, flexUsage, releaseList, slotMatches, funnel, readEskStatus, eskCredentials, addBusinessDays };
 });

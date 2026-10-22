@@ -6,7 +6,7 @@ const pct = (x, d = 0) => x == null || isNaN(x) ? '—' : (x * 100).toFixed(d) +
 const num = x => x == null || isNaN(x) ? '—' : Math.round(x).toLocaleString();
 const days = x => x == null ? '—' : x + (x === 1 ? ' day' : ' days');
 
-const SHEETS = { appt: 'Appointment List', ref: 'Ref', st: 'Slot Types', prov: 'Providers', hist: 'TA 3NA History', eskst: 'PT ESK Status' };
+const SHEETS = { appt: 'Appointment List', ref: 'Ref', st: 'Slot Types', prov: 'Providers', hist: 'TA 3NA History', eskst: 'PT ESK Status', pcr: 'Payer Credential Rules' };
 const OUT_PREFIX = 'TA ', PT_PREFIX = 'PT ';   // TA tabs are counts only; PT tabs list patients by LASFIR code
 const VIEWS = [['overview', 'Overview'], ['templates', 'Templates'], ['access', 'Access'], ['cadence', 'Cadence'], ['funnel', 'Funnel'], ['recall', 'Recall'], ['visits', 'Visits'], ['impact', 'Provider impact'], ['trends', 'Trends'], ['setup', 'Setup']];
 const S = { view: 'overview', data: null, R: null, f: { from: '', to: '', loc: '', prov: '', sl: '' }, opts: { lateHours: 24, target: 14, asOf: '', releaseHours: 24, convDays: 90, lapsedDays: 60, overdueMult: 1.5, tmsCount: 30, maintDays: 180, matchDays: 10, dayStart: '08:00', dayEnd: '18:00' }, heatMetric: 'fill', trendType: '', impactWhy: '', recallState: 'call', store: null, mode: 'pane', full: false };
@@ -181,6 +181,7 @@ function prepare(raw){
     st: cfgRows(raw.cfg.st, SPEC.st), stExists: !!raw.cfg.st,
     prov: cfgRows(raw.cfg.prov, SPEC.prov).map(p => ({ name: String(p.name || '').trim(), label: String(p.label || '').trim(), cred: String(p.cred || '').trim(), include: p.include })), provExists: !!raw.cfg.prov,
     eskStatus: raw.cfg.eskst ? TC.readEskStatus(raw.cfg.eskst) : null,
+    payerRules: raw.cfg.pcr ? PayerRules.read(raw.cfg.pcr) : null,
     hist: cfgRows(raw.cfg.hist, SPEC.hist).map(h => ({ date: TE.parseDate(h.date), prov: String(h.prov || ''), type: String(h.type || ''), next: h.next === '' ? null : +h.next, third: h.third === '' ? null : +h.third, open: +h.open || 0 })),
   };
 }
@@ -201,6 +202,14 @@ function run(){
       releaseHours: co.releaseHours, dayStart: co.dayStart, dayEnd: co.dayEnd },
   });
   runCadence(co);
+  runPayerRules();
+}
+// ESK visits against the Payer Credential Rules sheet (needs the sheet and a payer column on the report)
+function runPayerRules(){
+  const d = S.data, R = S.R, pr = d.payerRules; S.P = null;
+  if (!pr || pr.error || !pr.rules.length || !d.ap.has.payer) return;
+  const one = x => x ? new Set([x]) : null;
+  S.P = TC.eskCredentials(d.ap.rows, d.ref, pr.rules, PayerRules, n => PayerRules.credOf(credOf(n)), new Set(R.people), { asOf: R.asOf, from: R.from, to: R.to, provs: one(S.f.prov), locs: one(S.f.loc) });
 }
 // patient-level views need a patient column; everything else works without one
 function runCadence(co){
@@ -361,7 +370,7 @@ function vAccess(){
   let trend = '';
   if (R.threeNaHist && tt){ const pts = R.threeNaHist.filter(h => h.type === tt).map(h => ({ x: TE.mdy(h.week), y: h.third })); trend = lineChart('t3na', `3NA, ${tt} (rebuilt from created dates)`, pts, v => Math.round(v) + ' d'); }
   else if (tt){ const byD = new Map(); (S.data.hist || []).filter(h => h.type === tt && h.prov === 'All providers').forEach(h => byD.set(h.date, h.third)); const pts = [...byD.entries()].sort((a, b) => a[0] - b[0]).map(([d, v]) => ({ x: TE.mdy(d), y: v })); trend = lineChart('t3na', `3NA, ${tt} (saved snapshots)`, pts, v => Math.round(v) + ' d'); }
-  const esk = S.esk ? eskCard() : '';
+  const esk = (S.esk ? eskCard() : '') + payerCard();
   return `<div class="card"><h2>Third next available (3NA)<span class="sp"></span><button class="btn sm" data-act="snapshot">Save 3NA snapshot</button></h2>
     <div class="small muted">Calendar days from ${TE.mdy(R.asOf)} to the third open template slot of each type. Open = no Kept, Expected or No Show visit on the report, and no PTO or admin booked. Target: ${target()} days (change in Setup).</div>
     <h3>All providers</h3><div class="tw">${tbl(all)}</div><h3>By provider</h3><div class="tw">${tbl(per)}</div>
@@ -449,6 +458,25 @@ function vRecall(){
     </tbody></table></div><div class="small muted" style="margin-top:6px">Open template slots less than ${C.o.releaseHours} business hours away (Mon–Fri, ${TE.hhmm(C.o.dayStart)}–${TE.hhmm(C.o.dayEnd)}), plus the ones that cross into the window by the end of the next business day. Counted from ${t(Math.floor(C.now), Math.round((C.now % 1) * 1440))}.</div></div></div>`;
 }
 
+function payerCard(){
+  const d = S.data, pr = d.payerRules;
+  if (!pr) return '';
+  if (pr.error) return `<div class="card"><h2>Esketamine payer rules</h2><div class="msg bad">${esc(pr.error)}</div></div>`;
+  if (!d.ap.has.payer) return `<div class="card"><h2>Esketamine payer rules</h2><div class="msg info">Add <b>Payer Name</b> to the NextGen report so each ESK visit can be checked against the Payer Credential Rules tab.</div></div>`;
+  const P = S.P; if (!P) return '';
+  const t = r => `${TE.mdy(r.date)} ${TE.hhmm(r.start)}`;
+  const B = { approved: ['ok', 'Approved'], 'not approved': ['warn', 'Not approved'], pending: ['mute', 'Pending'], unknown: ['mute', '—'] };
+  const vis = rows => `<div class="tw" style="max-height:360px"><table><thead><tr><th>Visit</th><th>Patient</th><th>Provider</th><th>Cred</th><th>Event</th><th>Payer</th><th>Problem</th></tr></thead><tbody>${rows.slice(0, 300).map(r => `<tr><td>${t(r)}</td><td>${r.code ? esc(r.code) : ''}</td><td>${esc(r.prov)}</td><td>${esc(r.cred)}</td><td>${esc(r.event)}</td><td>${esc(r.payer)}</td><td class="small">${esc(r.why)}</td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="card"><h2>Esketamine payer rules <span class="chip mute">${num(P.rows.length)} ESK visits checked</span></h2>
+    ${P.upcoming.length ? `<h3>Upcoming visits the payer won’t pay this provider for (${num(P.upcoming.length)})</h3>${vis(P.upcoming)}<div class="small muted">Move these to a provider the payer allows, or confirm with billing.</div>` : '<div class="msg ok">Every upcoming ESK visit is booked with a credential the payer allows (or the payer isn’t on the list).</div>'}
+    ${P.unclear.length ? `<div class="small muted" style="margin-top:6px">${num(P.unclear.length)} upcoming visits match a payer with different rules by state (for example Anthem CA and WA) and the clinic name doesn’t say which. Add the state to the clinic name, or check those by hand.</div>` : ''}
+    ${P.past.length ? `<h3>Past visits in the range outside the payer’s rules (${num(P.past.length)})</h3>${vis(P.past)}` : ''}
+    <h3>By payer</h3><div class="tw" style="max-height:360px"><table><thead><tr><th>Payer on the report</th><th>Rule</th><th class="n">ESK visits</th><th class="n">With an MD</th><th class="n">With an NP</th><th>NP may bill</th><th>Besse</th><th class="n">Outside the rules</th></tr></thead><tbody>
+    ${P.byPayer.map(g => `<tr><td>${esc(g.payer)}</td><td>${g.rule ? esc(g.ambiguous ? g.rule + ' (state?)' : g.rule) : '<span class="muted">Not on the list</span>'}</td><td class="n">${num(g.visits)}</td><td class="n">${num(g.md)}</td><td class="n">${num(g.np)}</td><td class="small">${esc(g.npSteps || '')}</td><td>${g.rule ? `<span class="chip ${B[g.besse][0]}">${B[g.besse][1]}</span>` : ''}</td><td class="n">${g.blocked ? `<span class="chip bad">${num(g.blocked)}</span>` : '0'}</td></tr>`).join('')}
+    </tbody></table></div>
+    <div class="small muted" style="margin-top:6px">From the Payer Credential Rules tab (Setup). ESK visits on providers only; chairs carry no credential. The NextGen list can’t tell a first treatment from later dosing, so dosing visits are checked as observation unless the event name says “first”. A blank Besse cell shows as pending.</div></div>`;
+}
+
 function rateTable(rows, label, showLead){
   const R = S.R; const max = Math.max(1, ...rows.map(r => r.aAll));
   return `<div class="tw"><table><thead><tr><th>${label}</th><th class="n">Visits</th><th class="n">Kept</th><th class="n">No-show</th><th class="n">Cancel</th><th class="n">Late cx</th>${showLead ? '<th class="n">Median lead</th>' : ''}</tr></thead><tbody>
@@ -499,7 +527,7 @@ function vSetup(){
   return `<div class="card"><h2>Appointment list</h2>
     ${!ap ? `<div class="msg warn">No Appointment List tab yet. Import the NextGen appointment report below.</div>` : ap.error ? `<div class="msg bad">${esc(ap.error)} (tab “${esc(ap.sheet)}”)</div>` :
     `<div class="small">Tab <b>${esc(ap.sheet)}</b>: ${num(ap.rows.length)} visits, ${TE.mdy(ap.min)} – ${TE.mdy(ap.max)}${ap.runAt != null ? `, report run ${TE.mdy(ap.runAt)} ${TE.hhmm(Math.round((ap.runAt % 1) * 1440))}` : ''}.</div>
-     <div class="row" style="margin:6px 0">${flag(true, 'Date, time, provider, event, status')}${flag(has.dur, 'Duration / end time')}${flag(has.loc, 'Location')}${flag(has.cancel, 'Cancel date/time')}${flag(has.booked, 'Created date')}${flag(has.pt || has.mrn, 'Patient (Pat Name, Md Rc)')}</div>
+     <div class="row" style="margin:6px 0">${flag(true, 'Date, time, provider, event, status')}${flag(has.dur, 'Duration / end time')}${flag(has.loc, 'Location')}${flag(has.cancel, 'Cancel date/time')}${flag(has.booked, 'Created date')}${flag(has.pt || has.mrn, 'Patient (Pat Name, Md Rc)')}${flag(has.payer, 'Payer Name')}</div>
      ${has.cancel && has.booked ? '' : `<div class="msg info">Add <b>${[!has.cancel && 'Cancel Date and Cancel Time', !has.booked && 'Created Date (when the visit was booked)'].filter(Boolean).join('</b> and <b>')}</b> to the NextGen report. ${!has.cancel ? 'Cancel date/time is what separates late cancels from early ones. ' : ''}${!has.booked ? 'Created date gives lead time and lets the tool rebuild 3NA for past weeks.' : ''}</div>`}`}
     <div class="row"><label class="btn primary">Import NextGen report…<input type="file" accept=".xls,.xlsx,.csv" data-act="importAppts" hidden></label><span class="small muted">Replaces the Appointment List tab. Use the full date range you want to study plus the weeks ahead.</span></div></div>
   <div class="card"><h2>Provider templates<span class="sp"></span><button class="btn sm primary" data-act="newTemplate">New template tab</button></h2>
@@ -510,6 +538,7 @@ function vSetup(){
     <table><tbody>
       <tr><td><b>${SHEETS.st}</b></td><td class="small">Slot type → Clinical or Blocked, and which visits it accepts (event class, service line or event; comma = any of, + = all of, * = anything).</td><td>${d.stExists ? flag(true, `${d.st.length} rows`) : flag(false, 'Using built-in defaults')}</td><td><button class="btn sm" data-act="cfgSt">${d.stExists ? 'Add missing types' : 'Create'}</button></td></tr>
       <tr><td><b>${SHEETS.ref}</b></td><td class="small">NextGen event → event class, service line, whether it counts (holds and reference rows don’t), and Role (Consult, Start, Treatment, Follow-up) for cadence and the funnel.</td><td>${d.refExists ? flag(!(R && R.unmapped.length), R && R.unmapped.length ? `${R.unmapped.length} events not listed` : `${d.ref.length} rows`) : flag(false, 'Missing')}</td><td><button class="btn sm" data-act="cfgRef">${d.refExists ? 'Add missing events' : 'Create'}</button></td></tr>
+      <tr><td><b>${SHEETS.pcr}</b></td><td class="small">Which payers let an MD or an NP bill each esketamine visit, and Besse approval. Import the shared Payer Credential Rules file from OneDrive (Add-In Manifests); edit the tab when a payer changes.</td><td>${d.payerRules ? (d.payerRules.error ? flag(false, 'Can’t read it') : flag(true, `${d.payerRules.rules.length} rows`)) : flag(false, 'Not imported')}</td><td><label class="btn sm">Import…<input type="file" accept=".csv,.xlsx,.xls" data-act="importPayerRules" hidden></label></td></tr>
       <tr><td><b>${SHEETS.prov}</b></td><td class="small">NextGen provider → template label, credential, include. Leave Include blank to let the tool decide (people yes, chairs and rooms no).</td><td>${d.provExists ? flag(true, `${d.prov.length} rows`) : flag(false, 'Missing')}</td><td><button class="btn sm" data-act="cfgProv">${d.provExists ? 'Add missing providers' : 'Create'}</button></td></tr>
     </tbody></table>
     ${R && R.unknownTypes.length ? `<div class="msg warn">Slot types in templates but not on ${SHEETS.st}: ${R.unknownTypes.map(x => esc(x.type)).join(', ')}.</div>` : ''}</div>
@@ -573,6 +602,7 @@ document.addEventListener('change', async e => {
     else if (act === 'impactWhy'){ S.impactWhy = t.value; render(); }
     else if (act === 'recallState'){ S.recallState = t.value; render(); }
     else if (act === 'importEskStatus' && t.files[0]) await importEskStatus(t.files[0]);
+    else if (act === 'importPayerRules' && t.files[0]) await importPayerRules(t.files[0]);
     else if (act === 'importAppts' && t.files[0]) await importAppts(t.files[0]);
     else if (act === 'importEsk' && t.files[0]) await importEsk(t.files[0]);
     else if (act === 'tplCopy') fillTemplateDefaults();
@@ -710,6 +740,10 @@ async function writeReports(){
     await S.store.writeSheet('TA Flex Usage', [['Provider', 'Slot type', 'Accepts', 'Offered', 'Used', 'Use %', 'Consult', 'Start', 'Treatment', 'Follow-up', 'Release bookings', 'Release share', 'Scope']].concat(C.flex.map(r => [r.prov, r.type, r.accepts.map(x => ROLE_LABEL[x]).join(', ') || 'Anything', r.offered, r.used, P(r.useRate), r.roles.consult || 0, r.roles.start || 0, r.roles.treatment || 0, r.roles.followup || 0, r.release, P(r.releaseShare), scope])), { numFmt: pc([5, 11]) });
     extra = ', TA Cadence, TA Funnel, TA Flex Usage';
   }
+  if (S.P){
+    await S.store.writeSheet('TA ESK Payer Rules', [['Payer on the report', 'Rule', 'ESK visits', 'With an MD', 'With an NP', 'NP may bill', 'Besse', 'Outside the rules', 'Upcoming outside the rules', 'Scope']].concat(S.P.byPayer.map(g => [g.payer, g.rule, g.visits, g.md, g.np, g.npSteps || '', g.rule ? g.besse : '', g.blocked, g.upcomingBlocked, scope])));
+    extra += ', TA ESK Payer Rules';
+  }
   busy(false); toast('ok', `Wrote TA Summary, TA Slot Types, TA Visit Types, TA Weekly, TA Heatmap, TA 3NA, TA Exceptions${extra}.`);
 }
 // patient-level tabs: LASFIR codes only, never names or record numbers
@@ -754,6 +788,15 @@ async function importEskStatus(file){
   await S.store.writeSheet(SHEETS.eskst, [['LASFIR', 'Clinic', 'Status', 'Last Dose Date', 'Pause Reason', 'Expected Return Date']].concat(r.rows.map(x => [x.code, x.clinic, x.status, x.lastDose ?? '', x.reason, x.ret ?? ''])), { numFmt: { 3: 'm/d/yyyy', 5: 'm/d/yyyy' } });
   await S.store.setDoc('ctEskAt', TE.todaySerial());
   busy(false); toast('ok', `Loaded ESK Tracker status for ${r.rows.length} patients${r.skipped ? ` (${r.skipped} rows without a LASFIR code skipped)` : ''}.`); await reload();
+}
+async function importPayerRules(file){
+  const wb = await readFileAoa(file);
+  const aoa = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, raw: false, defval: '' });
+  const r = PayerRules.read(aoa); if (r.error) throw new Error(r.error);
+  if (S.data.payerRules && !S.data.payerRules.error && !confirm(`Replace the ${SHEETS.pcr} tab (${S.data.payerRules.rules.length} rows) with this file (${r.rules.length} rows)? Edits made on the tab will be lost.`)) return;
+  busy(true, 'Saving payer rules…');
+  await S.store.writeSheet(SHEETS.pcr, PayerRules.toRows(r.rules));
+  busy(false); toast('ok', `Loaded ${r.rules.length} payer rules${r.skipped ? ` (${r.skipped} rows without MD or NP skipped)` : ''}.`); await reload();
 }
 async function saveSnapshot(){
   const R = S.R; if (!R) return;
