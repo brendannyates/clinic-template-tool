@@ -79,24 +79,29 @@ function mockBook(sheets){
   return { Excel: { run: fn => fn(ctx) }, reads };
 }
 const bookOf = pack => pack.sheets.map(s => ({ name: s.name, hidden: !!s.hidden, rows: gridsOf(pack)[s.name] }));
-function loadApp(Excel){
-  const els = {};
-  const el = () => ({ addEventListener(){}, appendChild(){}, querySelectorAll: () => [], hidden: true, innerHTML: '', value: '', classList: { toggle(){} } });
-  const sandbox = { console, setTimeout, clearTimeout, Excel, Office: undefined, window: {}, location: { href: 'https://x/taskpane.html', search: '' },
-    document: { querySelector: s => els[s] || (els[s] = el()), querySelectorAll: () => [], addEventListener(){}, createElement: el, head: el() } };
+function loadApp(Excel, extra){
+  const els = {}, on = {};
+  const el = () => ({ addEventListener(){}, appendChild(){}, remove(){}, focus(){}, querySelector: () => null, querySelectorAll: () => [], hidden: true, innerHTML: '', value: '', classList: { toggle(){} } });
+  // timers never hold the test process open (toasts, the full screen relay's 2-minute timeout)
+  const later = (f, ms) => { const h = setTimeout(f, ms); if (h.unref) h.unref(); return h; };
+  const sandbox = { console, setTimeout: later, clearTimeout, Excel, Office: undefined, window: {}, location: { href: 'https://x/taskpane.html', search: '' },
+    document: { querySelector: s => els[s] || (els[s] = el()), querySelectorAll: () => [], addEventListener(k, f){ (on[k] = on[k] || []).push(f); }, createElement: el, head: el() } };
   sandbox.TE = require('../engine.js'); sandbox.TC = require('../cadence.js'); sandbox.PayerRules = PR; sandbox.SoharCore = C; sandbox.SoharRules = R; sandbox.self = sandbox;
+  Object.assign(sandbox, extra || {});
   vm.createContext(sandbox);
-  vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8') + '\n;this.__api = { OfficeStore, S, prepare, reload, render, seWrite, shownViews, navGroups, currentView };', sandbox);
-  return { api: sandbox.__api, els, doc: sandbox.document };
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8') + '\n;this.__api = { OfficeStore, RemoteStore, RELAY_OPS, S, prepare, reload, render, seWrite, shownViews, navGroups, currentView };', sandbox);
+  // fire the page's own click / change handlers with a fake event (each returns its promise)
+  const fire = (k, e) => Promise.all((on[k] || []).map(f => f(e)));
+  return { api: sandbox.__api, els, doc: sandbox.document, fire };
 }
 // an app whose store is the mock workbook (load) plus a writeSheet log
 async function appWith(sheets){
-  const { Excel, reads } = mockBook(sheets); const { api, els, doc } = loadApp(Excel);
+  const { Excel, reads } = mockBook(sheets); const { api, els, doc, fire } = loadApp(Excel);
   const writes = [], docs = {};
   const office = api.OfficeStore();
   api.S.store = { live: true, load: office.load, writeSheet: async (n, aoa, fmt) => { writes.push([n, aoa, fmt]); }, getDoc: k => docs[k] ?? null, setDoc: async (k, v) => { docs[k] = v; } };
   await api.reload();
-  return { api, els, doc, writes, docs, reads };
+  return { api, els, doc, writes, docs, reads, fire };
 }
 
 test('pack -> workbook -> load() -> prepare -> derive gives the clinic list; no names or DOBs anywhere', async () => {
@@ -161,6 +166,12 @@ test('load() reads a clinic file\'s own sheets whole (hidden, every column, 500 
   assert.equal(raw2.se, undefined);
   assert.deepEqual(Object.keys(raw2.grids).sort(), ['Clinic Work', 'Read Me', 'Sheet1']);
   assert.equal(raw2.appt.sheet, 'Appt export');
+  // lookup tabs are read under their own keys (they were filed under 'ref,Ref' and never seen)
+  const lookups = plain.concat([{ name: 'Ref', rows: [['Event', 'Class'], ['Consult', 'Visit']] }, { name: 'providers', rows: [['NextGen Provider', 'Label'], ['Reyes MD, Samuel', 'Reyes']] }]);
+  const raw3 = await loadApp(mockBook(lookups).Excel).api.OfficeStore().load();
+  assert.deepEqual(Object.keys(raw3.cfg).sort(), ['prov', 'ref']);
+  assert.equal(raw3.cfg.prov[1][1], 'Reyes');
+  assert.ok(!('Ref' in raw3.grids) && !('providers' in raw3.grids), 'lookup tabs are never template grids');
   // a wrong file shows its error on Setup and leaves the template tools as they are
   const bad = sheets.map(s => s.name === 'SE Info' ? Object.assign({}, s, { rows: [['Setting', 'Value'], ['Kind', 'Sohar Clinic'], ['Format', '1']] }) : s);
   const { api: a3, els } = await appWith(bad);
@@ -185,7 +196,7 @@ test('Clinic Work: each change upserts by Kind + Key and rewrites the whole shee
   await api.seWrite({ Kind: 'Note', Key: '900002', MRN: '900002', LASFIR: 'BRABRA', Note: 'New card at check-in' });
   await api.seWrite({ Kind: 'Payer note', Key: 'Cigna', Value: 'Cigna Open Access Plus', Note: 'Group 0042' });
   assert.equal(writes.length, 5);
-  assert.ok(writes.every(w => w[0] === 'Clinic Work' && w[2].keepFormat && w[2].inPlace && w[2].text && w[1][0].join() === R.CLINIC_WORK_COLS.join()), 'as text, over the old rows');
+  assert.ok(writes.every(w => w[0] === 'Clinic Work' && w[2].keepFormat && w[2].inPlace && w[2].text && w[2].table === 'tblClinicWork' && w[1][0].join() === R.CLINIC_WORK_COLS.join()), 'as text, over the old rows, inside the table');
   const last = JSON.parse(JSON.stringify(writes[4][1])).slice(1).map(v => Object.fromEntries(R.CLINIC_WORK_COLS.map((c, i) => [c, v[i]])));
   assert.deepEqual(last.map(r => [r.Kind, r.Key, r.Value]), [['Re-verify anyway', '900001', 'Off'], ['Task done', ben, 'Yes'], ['Note', '900002', ''], ['Payer note', 'Cigna', 'Cigna Open Access Plus']]);
   assert.ok(last.every(r => r.By === 'Clinic San Rafael' && /^\d{4}-\d\d-\d\dT/.test(r.When)));
@@ -295,4 +306,249 @@ test('ticking a box re-draws the list and puts keyboard focus back on the same c
   doc.activeElement = undefined;
   await api.seWrite({ Kind: 'Re-verify anyway', Key: '900001', MRN: '900001', LASFIR: 'QUITES', Value: 'Off' });
   assert.equal(seen.length, 2);
+});
+
+// ---------- Clinic Work inside tblClinicWork: a stateful sheet with a table that keeps Excel's bounds rules. Ops apply per sync,
+// in order, with no rollback. resize (ExcelApi 1.13) must keep the header row and overlap the table; rows.add inserts at the
+// table's end and shifts the cells below it down (Microsoft Learn: "Any rows below the inserted row are shifted downwards").
+// The admin's flow ("List rows present in a table") sees only inTable(). o: {noResize, failResize, failAdd, failSync(n)} ----------
+function tableSheet(rows, tbl, o = {}){
+  const g = rows.map(r => r.map(v => ({ v, f: '@' })));   // what an earlier text write left
+  const cell = (r, c) => { while (g.length <= r) g.push([]); while (g[r].length <= c) g[r].push({ v: '', f: 'General' }); return g[r][c]; };
+  const parse = (v, f) => { if (f === '@' || typeof v !== 'string') return v; if (v.startsWith('=')) throw new Error('InvalidArgument: formula'); return /^-?\d+(\.\d+)?$/.test(v) ? +v : v; };
+  const t = tbl ? Object.assign({ name: 'tblClinicWork', r0: 0, c0: 0, cols: R.CLINIC_WORK_COLS.length }, tbl) : null;
+  let q = [], n = 0;
+  const range = (r0, c0, h, w) => {
+    const each = (v, fn) => { assert.ok(v.length === h && v.every(x => x.length === w), `array must be ${h}×${w}`); v.forEach((x, i) => x.forEach((y, j) => fn(cell(r0 + i, c0 + j), y))); };
+    return { _b: { r0, c0, h, w }, set numberFormat(v){ q.push(() => each(v, (c, y) => { c.f = y; })); }, set values(v){ q.push(() => each(v, (c, y) => { c.v = parse(y, c.f); })); },
+      clear(a){ q.push(() => { for (let i = 0; i < h; i++) for (let j = 0; j < w; j++) { const c = cell(r0 + i, c0 + j); c.v = ''; if (a !== 'Contents') c.f = 'General'; } }); } };
+  };
+  const used = () => { const u = g.map((r, i) => [i, r.reduce((m, c, j) => (c.v !== '' ? j + 1 : m), 0)]).filter(x => x[1]);
+    return u.length ? { isNullObject: false, rowIndex: 0, columnIndex: 0, rowCount: u[u.length - 1][0] + 1, columnCount: Math.max(...u.map(x => x[1])) } : { isNullObject: true }; };
+  const table = t && { isNullObject: false,
+    getRange(){ const r = { load(){} }; q.push(() => Object.assign(r, { rowIndex: t.r0, columnIndex: t.c0, rowCount: t.rows, columnCount: t.cols })); return r; },
+    resize: o.noResize ? undefined : rg => { q.push(() => { if (o.failResize) throw new Error('ApiNotFound'); const b = rg._b;
+      assert.equal(b.r0, t.r0, 'the header stays in its row'); assert.ok(b.c0 < t.c0 + t.cols && b.c0 + b.w > t.c0, 'the new range overlaps the table'); Object.assign(t, { rows: b.h, cols: b.w, c0: b.c0 }); }); },
+    rows: { add: (i, values) => { q.push(() => {
+      if (o.failAdd) throw new Error('InvalidOperation');
+      assert.ok(i == null && values.every(r => r.length === t.cols), 'rows at the end, as wide as the table');
+      const k = values.length, at = t.r0 + t.rows, last = g.length - 1;
+      for (let j = t.c0; j < t.c0 + t.cols; j++){
+        for (let r = last; r >= at; r--){ const s = cell(r, j), d = cell(r + k, j); d.v = s.v; d.f = s.f; }
+        for (let x = 0; x < k; x++){ const c = cell(at + x, j); c.f = 'General'; c.v = parse(values[x][j - t.c0], 'General'); }
+      }
+      t.rows += k; }); } } };
+  const ws = { name: 'Clinic Work', isNullObject: false, getRangeByIndexes: range,
+    getUsedRangeOrNullObject(){ const u = { load(){} }; q.push(() => Object.assign(u, used())); return u; },
+    tables: { getItemOrNullObject: nm => (t && nm === t.name ? table : { isNullObject: true }) } };
+  const ctx = { sync: async () => { const ops = q; q = []; n++; if (o.failSync && o.failSync(n)) throw new Error('RequestThrottled'); ops.forEach(op => op()); },
+    workbook: { worksheets: { getItemOrNullObject: () => ws, add(){ throw new Error('no add'); } } } };
+  const trim = r => { const x = r.slice(); while (x.length && x[x.length - 1] === '') x.pop(); return x; };
+  const values = () => g.map(r => trim(r.map(c => c.v))).filter(r => r.length);
+  const inTable = () => Array.from({ length: t.rows }, (_, i) => Array.from({ length: t.cols }, (_, j) => (g[t.r0 + i] && g[t.r0 + i][t.c0 + j] ? g[t.r0 + i][t.c0 + j].v : '')));
+  return { Excel: { run: fn => fn(ctx) }, values, inTable, table: () => Object.assign({}, t), formats: () => g.map(r => r.map(c => c.f)), syncs: () => n };
+}
+const FMT = { keepFormat: true, inPlace: true, text: true, table: 'tblClinicWork' };
+const wr = (kind, key, extra) => Object.assign({ Kind: kind, Key: key, MRN: String(key).split('|')[0], LASFIR: 'QUITES', By: 'Clinic San Rafael' }, extra);
+const CHANGES = [wr('Task done', '0090001|Update benefits in NextGen', { Value: 'Yes', Note: '=> called the patient, new card scanned' }), wr('Note', '0090001', { Note: 'New card at check-in' }),
+  wr('Re-verify anyway', '900002', { Value: 'On' }), wr('Payer note', 'Cigna', { Value: '00123', Note: 'Group 0042' })];
+const plainRows = rows => JSON.parse(JSON.stringify(rows));
+
+test('every Clinic Work write leaves all its rows inside tblClinicWork, as text, and the table never shrinks', async () => {
+  // as Sohar exports it: header + one blank row (A1:H2)
+  const sh = tableSheet([R.CLINIC_WORK_COLS], { rows: 2 });
+  const store = loadApp(sh.Excel).api.OfficeStore();
+  let work = [];
+  for (const ch of CHANGES){
+    work = R.workRows(work, ch, NOW);
+    const res = await store.writeSheet('Clinic Work', workAoa(work), FMT);
+    assert.equal(res.table, 'ok');
+    assert.deepEqual(sh.inTable(), workAoa(work).length < 2 ? workAoa(work).concat([R.CLINIC_WORK_COLS.map(() => '')]) : workAoa(work), `after ${work.length} rows the flow sees them all`);
+  }
+  assert.deepEqual(sh.values(), workAoa(work), 'nothing outside the table');
+  assert.equal(sh.inTable()[1][2], '0090001', 'leading zeros kept');
+  assert.equal(sh.inTable()[1][5], '=> called the patient, new card scanned', 'a note starting with = is text');
+  // a table already bigger than the rows stays that size
+  const big = tableSheet([R.CLINIC_WORK_COLS], { rows: 9 });
+  assert.equal((await loadApp(big.Excel).api.OfficeStore().writeSheet('Clinic Work', workAoa(work.slice(0, 2)), FMT)).table, 'ok');
+  assert.equal(big.table().rows, 9);
+  // other sheets never get a table result
+  const plain = tableSheet([['A']], null);
+  assert.equal(await loadApp(plain.Excel).api.OfficeStore().writeSheet('Clinic Work', [['A'], ['1']], { keepFormat: true, inPlace: true, text: true }), undefined);
+});
+
+test('rows an older write left below the table are pulled in by the next write (resize, or rows.add where resize is missing)', async () => {
+  const old = R.workRows([], CHANGES.slice(0, 3), NOW);   // 3 rows written by the old code: the table still ends at row 2
+  for (const o of [{}, { noResize: true }, { failResize: true }]){
+    const sh = tableSheet(workAoa(old), { rows: 2 }, o);
+    assert.equal(sh.inTable().length - 1, 1, 'the flow saw one row of three');
+    // what the pane does: read the sheet (all rows), apply the change, write the whole sheet
+    const next = R.workRows(R.tableObjects(sh.values()), CHANGES[3], NOW);
+    const res = await loadApp(sh.Excel).api.OfficeStore().writeSheet('Clinic Work', workAoa(next), FMT);
+    const how = JSON.stringify(o);
+    assert.equal(res.table, 'ok', how);
+    assert.deepEqual(sh.inTable(), workAoa(next), `${how}: all four rows inside the table`);
+    assert.deepEqual(sh.values(), workAoa(next), `${how}: no copies left below it (and '00123' is still text)`);
+    assert.ok(sh.formats().slice(0, 5).every(r => r.slice(0, 8).every(f => f === '@')), `${how}: added rows are text`);
+  }
+});
+
+test('a Clinic Work table write is fail-safe: the rows written stay whatever fails, and the result says the table is short', async () => {
+  const before = workAoa(R.workRows([], CHANGES.slice(0, 2), NOW));
+  const next = workAoa(R.workRows(R.tableObjects(before), CHANGES.slice(2), NOW));
+  const write = async (sh, aoa) => loadApp(sh.Excel).api.OfficeStore().writeSheet('Clinic Work', aoa, FMT);
+  // resize and rows.add both fail: the rows are on the sheet (the clinic loses nothing), the table is as it was
+  const a = tableSheet(before, { rows: 3 }, { failResize: true, failAdd: true });
+  assert.equal((await write(a, next)).table, 'short');
+  assert.deepEqual(a.values(), next);
+  assert.equal(a.table().rows, 3);
+  // the values sync fails: nothing changes, and the error reaches seWrite (sync 1 finds the sheet, 2 reads its size, 3 writes)
+  const b = tableSheet(before, { rows: 3 }, { failSync: n => n === 3 });
+  await assert.rejects(write(b, next), /RequestThrottled/);
+  assert.deepEqual([b.values(), b.table().rows], [before, 3]);
+  // the table lookup itself fails (sync 5): still a saved write, reported short
+  const c = tableSheet(before, { rows: 3 }, { failSync: n => n === 5 });
+  assert.equal((await write(c, next)).table, 'short');
+  assert.deepEqual(c.values(), next);
+  // the clean-up after rows.add fails (no resize: 7 adds, 8 reads the bounds, 9 clears): the table has every row, copies sit below
+  const d = tableSheet(before, { rows: 3 }, { noResize: true, failSync: n => n === 9 });
+  assert.equal((await write(d, next)).table, 'ok');
+  assert.deepEqual(d.inTable(), next);
+  assert.ok(d.values().length > next.length, 'the shifted copies are still below the table');
+  const objs = R.tableObjects(d.values()).filter(r => r.Kind);
+  assert.equal(new Set(objs.map(r => r.Kind + '|' + r.Key)).size, 4, 'the copies below repeat rows already in the table');
+  // no table on the sheet: written, reported missing
+  const e = tableSheet(before, null);
+  assert.equal((await write(e, next)).table, 'missing');
+  assert.deepEqual(e.values(), next);
+});
+
+test('seWrite asks for the table, and says once when the rows could not go inside it', async () => {
+  const { src } = adminSrc();
+  const { api, els } = await appWith(bookOf(R.clinicPack(LOC, src)));
+  const toasts = []; els['#toast'] = { appendChild: d => toasts.push([d.className, d.innerHTML]) };
+  const fmts = []; let res = { table: 'ok' };
+  api.S.store.writeSheet = async (n, aoa, fmt) => { fmts.push(fmt); return res; };
+  await api.seWrite(wr('Re-verify anyway', '900001', { Value: 'On' }));
+  assert.equal(toasts.length, 0);
+  res = { table: 'short' };
+  await api.seWrite(wr('Re-verify anyway', '900001', { Value: 'Off' }));
+  await api.seWrite(wr('Re-verify anyway', '900001', { Value: 'On' }));
+  assert.equal(toasts.length, 1, 'once a session');
+  assert.equal(toasts[0][0], 'msg warn');
+  assert.match(toasts[0][1], /Saved on the Clinic Work tab\. The admin’s inbox reads only the rows inside the Clinic Work table.*send the saved file to the admin/);
+  assert.ok(fmts.every(f => f.table === 'tblClinicWork'));
+  assert.equal(api.S.E.rows.find(r => r.key === '900001')['Re-verify Anyway'], 'Yes', 'the change stands');
+});
+
+test('full screen: the table option goes through the relay and the result comes back', async () => {
+  const sent = []; let rx = null;
+  const Office = { onReady: cb => cb({ host: 'None' }), HostType: { Excel: 'Excel' }, EventType: { DialogParentMessageReceived: 'parent' },
+    context: { ui: { addHandlerAsync: (k, h) => { rx = h; }, messageParent: s => sent.push(s) } } };
+  const { api } = loadApp(mockBook([]).Excel, { Office });
+  assert.ok(api.RELAY_OPS.includes('writeSheet'));
+  const rs = api.RemoteStore();
+  const aoa = workAoa(R.workRows([], CHANGES[0], NOW));
+  const p = rs.writeSheet('Clinic Work', aoa, FMT);
+  const parts = sent.map(s => JSON.parse(s)).sort((x, y) => x.i - y.i);
+  const msg = JSON.parse(parts.map(x => x.d).join(''));
+  assert.equal(msg.op, 'writeSheet');
+  assert.deepEqual(msg.args, [ 'Clinic Work', plainRows(aoa), FMT ]);
+  rx({ message: JSON.stringify({ c: 'r1', i: 0, n: 1, d: JSON.stringify({ rid: msg.rid, ok: true, res: { table: 'short' } }) }) });
+  assert.equal((await p).table, 'short');
+});
+
+test('done notes: a Note button by each clinic task; a note keeps the tick, a tick keeps the note, and the admin gets it from the file or the inbox', async () => {
+  const { src } = adminSrc();
+  const { api, els, writes, fire } = await appWith(bookOf(R.clinicPack(LOC, src)));
+  const S = api.S;
+  const task = mrn => S.E.tasks.find(t => t.MRN === mrn && t.Task === 'Update benefits in NextGen');
+  const key = task('900001')['Task Key'];
+  S.view = 'eligibility'; api.render();
+  let html = els['#app'].innerHTML;
+  const count = s => html.split(s).length - 1;
+  assert.ok(count('data-act="seDone"') > 0);
+  assert.equal(count('data-act="seTaskNote"'), count('data-act="seDone"'), 'one note button per task tick');
+  // open the dialog: LASFIR + MRN only
+  await fire('click', { target: { closest: s => (s === '[data-act]' ? { tagName: 'BUTTON', dataset: { act: 'seTaskNote', k: key } } : null) } });
+  const dlg = els['#sheet'].innerHTML;
+  assert.ok(dlg.includes('Done note · QUITES') && dlg.includes('MRN 900001') && dlg.includes('data-act="seTaskNoteSave"'));
+  for (const s of NEVER) assert.ok(!dlg.includes(s), `"${s}" is not in the dialog`);
+  const save = async note => { els['#seNoteText'] = { value: note }; await fire('click', { target: { closest: s => (s === '[data-act]' ? { tagName: 'BUTTON', dataset: { act: 'seTaskNoteSave', k: key } } : null) } }); };
+  const tick = async on => fire('change', { target: { dataset: { act: 'seDone', k: key, m: '900001' }, checked: on } });
+  const lastRow = () => R.tableObjects(writes[writes.length - 1][1]).find(r => r.Kind === 'Task done' && r.Key === key);
+  // a note with the box unticked: a note-only row, Done stays as the file has it
+  await save('  Called the patient, new card scanned ');
+  assert.deepEqual([lastRow().Value, lastRow().Note], ['', 'Called the patient, new card scanned']);
+  assert.deepEqual([task('900001').Done, task('900001').clinicNote], ['', 'Called the patient, new card scanned']);
+  html = els['#app'].innerHTML;
+  assert.ok(html.includes('Your note:</span> Called the patient, new card scanned') && html.includes('>Edit note<'));
+  const m0 = R.mergeClinicWork(writes[writes.length - 1][1], { location: LOC, requests: [], tasks: src.tasks, sentDone: S.SE.done, notes: [], payerNotes: [] });
+  assert.equal(m0.done.has(key), false, 'note only: the admin’s Done is left alone');
+  assert.match(m0.doneNotes.get(key), /^Called the patient, new card scanned \(Clinic San Rafael, San Rafael, \d{1,2}\/\d{1,2}\)$/);
+  // tick it: the note stays; edit the note: the tick stays; clear it: the tick stays
+  await tick(true);
+  assert.deepEqual([lastRow().Value, lastRow().Note], ['Yes', 'Called the patient, new card scanned']);
+  await save('Called the patient twice');
+  assert.deepEqual([lastRow().Value, lastRow().Note, task('900001').Done], ['Yes', 'Called the patient twice', 'Yes']);
+  const m1 = R.mergeClinicWork(writes[writes.length - 1][1], { location: LOC, requests: [], tasks: src.tasks, sentDone: S.SE.done, notes: [], payerNotes: [] });
+  assert.deepEqual([m1.done.get(key), m1.doneNotes.get(key).split(' (')[0]], [`Yes (clinic ${LOC})`, 'Called the patient twice']);
+  // the same rows through the central inbox (what the flow appends) apply the same way
+  const inbox = R.tableObjects(writes[writes.length - 1][1]).map(r => Object.assign({ Location: LOC, File: `Clinic Eligibility - ${LOC} 2026-10-23.xlsx`, Received: NOW.toISOString() }, r));
+  const byLoc = R.inboxWork(inbox, NOW);
+  const m2 = R.mergeClinicWork(byLoc.get(LOC), { location: LOC, requests: [], tasks: src.tasks, sentDone: S.SE.done, notes: [], payerNotes: [], now: NOW });
+  assert.deepEqual([m2.done.get(key), m2.doneNotes.get(key)], [m1.done.get(key), m1.doneNotes.get(key)]);
+  await save('');
+  assert.deepEqual([lastRow().Value, lastRow().Note, task('900001').clinicNote], ['Yes', '', '']);
+  assert.ok(!els['#app'].innerHTML.includes('Your note:</span>'));
+  const m3 = R.mergeClinicWork(writes[writes.length - 1][1], { location: LOC, requests: [], tasks: src.tasks, sentDone: S.SE.done, notes: [], payerNotes: [] });
+  assert.equal(m3.doneNotes.has(key), false, 'a cleared note never erases the admin’s');
+  // reopening the saved file shows the note again
+  await save('Called the patient twice');
+  const again = await appWith(bookOf(R.clinicPack(LOC, src)).map(s => (s.name === 'Clinic Work' ? Object.assign({}, s, { rows: writes[writes.length - 1][1] }) : s)));
+  const t2 = again.api.S.E.tasks.find(t => t['Task Key'] === key);
+  assert.deepEqual([t2.Done, t2.clinicNote], ['Yes', 'Called the patient twice']);
+});
+
+test('a dialog takes keyboard focus, keeps Tab inside, and gives focus back to the button that opened it', async () => {
+  const { src } = adminSrc();
+  const { api, els, doc, fire } = await appWith(bookOf(R.clinicPack(LOC, src)));
+  const S = api.S;
+  const key = S.E.tasks.find(t => t.MRN === '900001' && t.Task === 'Update benefits in NextGen')['Task Key'];
+  S.view = 'eligibility'; api.render();
+  // a fake focusable: focus() makes it the active element and logs it
+  const log = [];
+  const node = (name, dataset) => { const n = { name, dataset: dataset || {}, focus(){ doc.activeElement = n; log.push(name); } }; return n; };
+  const opener = node('note button', { act: 'seTaskNote', k: key, m: '900001' });
+  const app = []; els['#app'].querySelector = sel => { app.push(sel); return node('note button again', opener.dataset); };
+  const text = node('textarea'), save = node('save', { act: 'seTaskNoteSave', k: key }), cancel = node('cancel', { act: 'close' });
+  const sheet = doc.querySelector('#sheet');
+  sheet.querySelector = sel => (sel === 'textarea, input, select, button' ? text : null);
+  sheet.querySelectorAll = () => [text, save, cancel];
+  const sel = `[data-act="seTaskNote"][data-k="${key}"][data-m="900001"]`;
+  const open = async () => { doc.activeElement = opener; await fire('click', { target: { closest: s => (s === '[data-act]' ? { tagName: 'BUTTON', dataset: opener.dataset } : null) } }); };
+  // the keydown handler is synchronous: returns whether it took the key
+  const press = (k, shiftKey) => { let took = false; fire('keydown', { key: k, shiftKey: !!shiftKey, preventDefault(){ took = true; } }); return took; };
+  // opening moves focus to the note box
+  await open();
+  assert.equal(els['#modal'].hidden, false);
+  assert.equal(doc.activeElement, text);
+  // Tab walks the dialog's own controls and wraps; Shift+Tab wraps back
+  assert.equal(press('Tab'), true); assert.equal(doc.activeElement, save);
+  press('Tab'); assert.equal(doc.activeElement, cancel);
+  press('Tab'); assert.equal(doc.activeElement, text);
+  press('Tab', true); assert.equal(doc.activeElement, cancel);
+  // Escape closes it and focus goes back to the Note button
+  press('Escape');
+  assert.equal(els['#modal'].hidden, true);
+  assert.deepEqual([app[app.length - 1], doc.activeElement.name], [sel, 'note button again']);
+  // a closed dialog leaves Tab alone
+  assert.equal(press('Tab'), false);
+  // Save re-draws the list; focus lands on the same Note button in the new list
+  await open(); app.length = 0;
+  els['#seNoteText'] = { value: 'Called the patient' };
+  await fire('click', { target: { closest: s => (s === '[data-act]' ? { tagName: 'BUTTON', dataset: save.dataset } : null) } });
+  assert.deepEqual(app, [sel, sel], 'once on close, once after the re-draw');
+  assert.equal(doc.activeElement.name, 'note button again');
+  assert.equal(S.E.tasks.find(t => t['Task Key'] === key).clinicNote, 'Called the patient');
 });

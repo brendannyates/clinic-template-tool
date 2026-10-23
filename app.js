@@ -16,6 +16,7 @@ const VIEW_LABEL = Object.fromEntries(VIEWS);
 // top tabs; a group with more than one visible view gets a sub-tab row
 const NAV = [['schedule', 'Schedule', ['overview', 'templates', 'impact', 'trends', 'visits']], ['patients', 'Patients', ['cadence', 'funnel', 'recall']], ['coverage', 'Coverage', ['eligibility', 'benefits', 'payers', 'access']], ['setup', 'Setup', ['setup']]];
 const SE_VIEWS = ['eligibility', 'benefits', 'payers'];   // need a Clinic Eligibility file; every other view but Setup needs the appointment list
+const SE_WORK_TABLE = 'tblClinicWork';   // the Clinic Work table Sohar's clinicPack makes; the admin's Power Automate flow reads it
 const AUTO_SHOW = 'Office.AutoShowTaskpaneWithDocument';
 const S = { view: 'overview', data: null, R: null, f: { from: '', to: '', loc: '', prov: '', sl: '' }, opts: { lateHours: 24, target: 14, asOf: '', releaseHours: 24, convDays: 90, lapsedDays: 60, overdueMult: 1.5, tmsCount: 30, maintDays: 180, matchDays: 10, dayStart: '08:00', dayEnd: '18:00' }, heatMetric: 'fill', trendType: '', impactWhy: '', recallState: 'call', store: null, mode: 'pane', full: false,
   SE: null, E: null, sub: {}, sePill: '', seQ: '', seBen: '' };
@@ -23,18 +24,41 @@ const S = { view: 'overview', data: null, R: null, f: { from: '', to: '', loc: '
 // ---------- small UI helpers ----------
 function toast(kind, html, ms = 5000){ const d = document.createElement('div'); d.className = 'msg ' + kind; d.innerHTML = html; $('#toast').appendChild(d); setTimeout(() => d.remove(), ms); }
 function busy(on, msg){ $('#busy').hidden = !on; if (msg) $('#busyMsg').textContent = msg; }
-function openModal(html){ $('#sheet').innerHTML = html; $('#modal').hidden = false; }
-function closeModal(){ $('#modal').hidden = true; $('#sheet').innerHTML = ''; const r = askRes; askRes = null; if (r) r(false); }
+// a control's data-act/k/m/v/p as a selector, so it can be found again after #app is re-drawn
+function actSel(el){ const d = el && el.dataset; return d && d.act ? ['act', 'k', 'm', 'v', 'p'].filter(k => d[k] != null).map(k => `[data-${k}="${String(d[k]).replace(/["\\]/g, '\\$&')}"]`).join('') : ''; }
+// the dialog takes keyboard focus (its first field, else first button, or `first`) and closing it puts focus back on the
+// control that opened it, found again by actSel (a Save re-draws #app); otherwise focus falls to the top of the page
+let modalFrom = '';
+const FOCUSABLE = 'textarea, input, select, button';
+function openModal(html, first){
+  if ($('#modal').hidden) modalFrom = actSel(document.activeElement);
+  $('#sheet').innerHTML = html; $('#modal').hidden = false;
+  const el = (first && $('#sheet').querySelector(first)) || $('#sheet').querySelector(FOCUSABLE); if (el) el.focus();
+}
+function closeModal(){
+  $('#modal').hidden = true; $('#sheet').innerHTML = ''; const r = askRes; askRes = null;
+  const sel = modalFrom; modalFrom = ''; const el = sel && $('#app').querySelector(sel); if (el) el.focus();
+  if (r) r(false);
+}
 // Office add-ins block window.confirm, so yes/no questions use the in-pane modal. Closing it any other way = Cancel.
 let askRes = null;
 function ask(html, ok = 'Continue'){
   return new Promise(res => {
-    openModal(`<h2>Please confirm</h2><div>${html}</div><div class="row" style="margin-top:12px"><button class="btn primary" data-act="askYes">${esc(ok)}</button><button class="btn" data-act="askNo">Cancel</button></div>`);
+    // focus starts on Cancel: these confirm a replace, so Enter alone should not do it
+    openModal(`<h2>Please confirm</h2><div>${html}</div><div class="row" style="margin-top:12px"><button class="btn primary" data-act="askYes">${esc(ok)}</button><button class="btn" data-act="askNo">Cancel</button></div>`, '[data-act="askNo"]');
     askRes = res;
   });
 }
 $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
-document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#modal').hidden) closeModal(); });
+// Tab and Shift+Tab stay inside an open dialog (aria-modal alone does not keep them there)
+document.addEventListener('keydown', e => {
+  if ($('#modal').hidden) return;
+  if (e.key === 'Escape') return closeModal();
+  if (e.key !== 'Tab') return;
+  const f = Array.from($('#sheet').querySelectorAll(FOCUSABLE)).filter(x => !x.disabled); if (!f.length) return;
+  const i = f.indexOf(document.activeElement), j = e.shiftKey ? (i <= 0 ? f.length - 1 : i - 1) : (i < 0 || i === f.length - 1 ? 0 : i + 1);
+  e.preventDefault(); f[j].focus();
+});
 
 // ---------- workbook access ----------
 function OfficeStore(){
@@ -51,6 +75,33 @@ function OfficeStore(){
     for (let i = 0; i < rows.length; i += 1000){ const part = rows.slice(i, i + 1000); const g = ws.getRangeByIndexes(r0 + i, 0, part.length, w); if (text) g.numberFormat = part.map(r => r.map(() => '@')); g.values = part; await ctx.sync(); }
     return w;
   }
+  // fmt.table (Clinic Work): Power Automate's "List rows present in a table" sees only rows inside the table, so after the
+  // in-place write the table grows to header + every row (never shrinks; header in row 1, as Sohar writes it). That also pulls in
+  // rows an older write left below it. resize needs ExcelApi 1.13; else rows.add, which inserts and pushes what is below down, so
+  // those copies are cleared after. Whatever fails, the rows already written stay on the sheet; the result says if the table has them.
+  async function fitTable(ctx, ws, name, aoa, w){
+    const t = ws.tables.getItemOrNullObject(name); await ctx.sync();
+    if (t.isNullObject) return { table: 'missing' };
+    const bounds = async () => { const r = t.getRange(); r.load('rowIndex,columnIndex,rowCount,columnCount'); await ctx.sync(); return r; };
+    const b = await bounds();
+    if (b.rowIndex !== 0 || b.columnIndex !== 0) return { table: 'short' };
+    if (b.rowCount >= aoa.length && b.columnCount >= w) return { table: 'ok' };
+    try { t.resize(ws.getRangeByIndexes(0, 0, Math.max(b.rowCount, aoa.length), Math.max(b.columnCount, w))); await ctx.sync(); return { table: 'ok' }; }
+    catch (e){ console.warn('Table resize failed; adding rows instead', e); }
+    if (b.rowCount >= aoa.length) return { table: 'short' };   // only columns were missing: rows.add can't add those
+    try {
+      const add = aoa.slice(b.rowCount).map(r => Array.from({ length: b.columnCount }, (_, j) => (r[j] == null ? '' : String(r[j]))));
+      t.rows.add(null, add.map(r => r.map(() => '')));   // blank first: in a General cell '0090001' turns into a number and '=…' into a formula
+      const g = ws.getRangeByIndexes(b.rowCount, 0, add.length, b.columnCount); g.numberFormat = add.map(r => r.map(() => '@')); g.values = add;
+      await ctx.sync();
+    } catch (e){ console.warn('Adding table rows failed', e); return { table: 'short' }; }
+    try {
+      const a = t.getRange(); a.load('rowIndex,columnIndex,rowCount,columnCount'); const u = ws.getUsedRangeOrNullObject(true); u.load('rowIndex,rowCount,columnIndex,columnCount'); await ctx.sync();
+      const end = u.isNullObject ? 0 : u.rowIndex + u.rowCount, top = a.rowIndex + a.rowCount;
+      if (end > top){ ws.getRangeByIndexes(top, 0, end - top, Math.max(a.columnCount, u.columnIndex + u.columnCount)).clear('Contents'); await ctx.sync(); }
+    } catch (e){ console.warn('Clearing below the table failed', e); }   // copies left below the table are harmless (last row per Kind + Key wins)
+    return { table: 'ok' };
+  }
   const settings = () => Office.context.document.settings;
   return {
     live: true,
@@ -65,7 +116,7 @@ function OfficeStore(){
       const seNames = Object.values(SR.SE_SHEETS).map(n => n.toLowerCase());
       const isSE = x => seFile && seNames.includes(x.name.toLowerCase());
       const apptX = info.find(x => !isSE(x) && !x.hidden && dims(x) && /^(appointment list|appt list)/i.test(x.name)) || info.find(x => !isSE(x) && dims(x) && /appointment|appt/i.test(x.name) && dims(x).rows > 50);
-      const cfgKey = n => Object.entries(SHEETS).find(([k, v]) => k !== 'appt' && v.toLowerCase() === n.toLowerCase());
+      const cfgKey = n => (Object.entries(SHEETS).find(([k, v]) => k !== 'appt' && v.toLowerCase() === n.toLowerCase()) || [])[0];
       // templates live on small visible sheets; hidden sheets and report tabs are never read
       const small = info.filter(x => x !== apptX && !isSE(x) && dims(x) && !x.hidden && !x.name.startsWith(OUT_PREFIX) && !x.name.startsWith(PT_PREFIX) && !cfgKey(x.name) && dims(x).rows <= 800 && dims(x).cols <= 80);
       for (let i = 0; i < small.length; i += 6){
@@ -89,16 +140,18 @@ function OfficeStore(){
         const rows = u.isNullObject ? 0 : u.rowIndex + u.rowCount, cols = u.isNullObject ? 0 : u.columnIndex + u.columnCount;
         if (rows > aoa.length) ws.getRangeByIndexes(aoa.length, 0, rows - aoa.length, Math.max(cols, w)).clear('Contents');
         if (cols > w && aoa.length) ws.getRangeByIndexes(0, w, Math.min(rows, aoa.length), cols - w).clear('Contents');
-        await ctx.sync(); return;
+        await ctx.sync();
+        return fmt.table ? fitTable(ctx, ws, fmt.table, aoa, w).catch(e => { console.warn(e); return { table: 'short' }; }) : undefined;
       }
       ws.getRange().clear(keep ? 'Contents' : undefined); await ctx.sync();
-      const w = await writeRows(ctx, ws, aoa);
+      const w = await writeRows(ctx, ws, aoa, 0, fmt.text);
       if (keep){ await ctx.sync(); return; }
       const hdr = ws.getRangeByIndexes(0, 0, 1, w); hdr.format.font.bold = true; hdr.format.fill.color = '#DCEFED';
       for (const [c, f] of Object.entries(fmt.numFmt || {})) if (aoa.length > 1) ws.getRangeByIndexes(1, +c, aoa.length - 1, 1).numberFormat = Array.from({ length: aoa.length - 1 }, () => [f]);
       ws.freezePanes.freezeRows(1);
       try { ws.getRangeByIndexes(0, 0, Math.min(aoa.length, 400), w).format.autofitColumns(); } catch {}
       await ctx.sync();
+      return fmt.table ? { table: 'missing' } : undefined;   // a sheet made here has no table
     }),
     replaceAppts: (sheetName, aoa, dateCol) => Excel.run(async ctx => {
       const { ws } = await sheetFor(ctx, sheetName || SHEETS.appt); ws.getRange().clear(); await ctx.sync();
@@ -629,7 +682,7 @@ function vEligibility(){
   if (S.sePill && !(S.sePill === 'tasks' ? withTasks : count.has(S.sePill))) S.sePill = '';
   const chip = (v, label, n, cls) => `<button class="chip ${cls}" data-act="sePill" data-v="${esc(v)}" aria-pressed="${S.sePill === v}">${esc(label)} ${num(n)}</button>`;
   return `<div class="card"><h2>Eligibility <span class="chip mute">${num(rows.length)} patients</span></h2>
-    <div class="small muted">Everyone whose next visit is here, soonest first. Do the tasks before the visit. Your ticks, re-verify requests and notes are saved on the Clinic Work tab and go back to the admin with the file.</div>
+    <div class="small muted">Everyone whose next visit is here, soonest first. Do the tasks before the visit. Your ticks, re-verify requests and notes are saved on the Clinic Work tab, and the admin picks them up from your clinic’s folder.</div>
     <div class="chips">${chip('', 'All', rows.length, 'mute')}${withTasks ? chip('tasks', 'Has tasks', withTasks, 'warn') : ''}${SR.PILLS.filter(p => count.has(p.label)).map(p => chip(p.label, p.label, count.get(p.label), PILL_CHIP[p.color] || 'mute')).join('')}</div>
     <input type="search" class="sesearch" data-act="seQ" value="${esc(S.seQ)}" placeholder="Search LASFIR or MRN" aria-label="Search LASFIR or MRN"></div>
   <div id="seList">${seListHTML(T)}</div>`;
@@ -662,7 +715,7 @@ function ptCard(r, T){
       ${r.Copay !== '' || r.Coinsurance !== '' ? `<dt>Copay</dt><dd>${r.Copay !== '' ? esc(usd(r.Copay) || r.Copay) : '—'}${r.Coinsurance !== '' ? ` · coinsurance ${esc(r.Coinsurance)}` : ''}</dd>` : ''}</dl>
     ${ben}
     ${items.length ? `<ul class="items">${items.map(t => `<li class="sev-${esc(t.severity || 'high')}">${SEV_WORD[t.severity] ? `<b>${SEV_WORD[t.severity]}:</b> ` : ''}${esc(t.detail)}</li>`).join('')}</ul>` : ''}
-    ${mine.map(t => `<label class="ck"><input type="checkbox" data-act="seDone" data-k="${esc(t['Task Key'])}" data-m="${k}"${t.Done ? ' checked' : ''}${t.doneBy === 'admin' ? ' disabled' : ''}><span><b>${esc(t.Task)}</b>${t.Details ? ` <span class="small muted">${esc(t.Details)}</span>` : ''}${t.doneBy === 'admin' ? ' <span class="chip ok">Done by the admin</span>' : ''}</span></label>`).join('')}
+    ${mine.map(seTaskHTML).join('')}
     ${adminOpen ? `<div class="small muted">${num(adminOpen)} more task${adminOpen === 1 ? '' : 's'} for the admin.</div>` : ''}
     ${r['Verification Skipped'] || r['Re-verify Anyway'] ? `<div class="msg info small">${r['Verification Skipped'] ? `${esc(r['Verification Skipped'])}, so this patient isn’t on this week’s verification file (next check ${esc(r['Next Check'] || '?')}).` : 'Verified recently.'}
       <label class="ck"><input type="checkbox" data-act="seRv" data-m="${k}"${r['Re-verify Anyway'] ? ' checked' : ''}> Re-verify anyway (new card, or another reason to check)</label></div>` : ''}
@@ -670,6 +723,21 @@ function ptCard(r, T){
     ${notes.length ? `<details class="more"><summary>Sohar notes (${notes.length})</summary><ul class="items">${notes.map(t => `<li>${esc(t)}</li>`).join('')}</ul></details>` : ''}
     <div class="pt-act"><button class="btn sm" data-act="seNote" data-m="${k}">${note ? 'Edit note' : 'Add note'}</button></div>
   </div>`;
+}
+// a clinic task: the Done tick, and next to it the done note (the Note on the task's Clinic Work "Task done" row)
+function seTaskHTML(t){
+  const tk = esc(t['Task Key']), m = esc(String(t['Task Key'] || '').split('|')[0]);
+  return `<div class="task"><label class="ck"><input type="checkbox" data-act="seDone" data-k="${tk}" data-m="${m}"${t.Done ? ' checked' : ''}${t.doneBy === 'admin' ? ' disabled' : ''}><span><b>${esc(t.Task)}</b>${t.Details ? ` <span class="small muted">${esc(t.Details)}</span>` : ''}${t.doneBy === 'admin' ? ' <span class="chip ok">Done by the admin</span>' : ''}</span></label>
+    <button class="btn sm" data-act="seTaskNote" data-k="${tk}" data-m="${m}" aria-label="${esc((t.clinicNote ? 'Edit the done note for ' : 'Add a done note for ') + t.Task)}">${t.clinicNote ? 'Edit note' : 'Note'}</button></div>
+    ${t.clinicNote ? `<div class="small tnote"><span class="muted">Your note:</span> ${esc(t.clinicNote)}</div>` : ''}`;
+}
+function seTaskNoteDialog(key){
+  const t = S.E.tasks.find(x => x['Task Key'] === key), r = t && seRow(String(key).split('|')[0]); if (!t || !r.key) return;
+  openModal(`<h2>Done note · ${seTag(r)} · ${seId(r)}</h2>
+    <div class="small"><b>${esc(t.Task)}</b>${t.Details ? ` <span class="muted">${esc(t.Details)}</span>` : ''}</div>
+    <div class="fld">What you did<textarea id="seNoteText" maxlength="500" placeholder="${esc('For example: called the patient, new card scanned')}">${esc(t.clinicNote || '')}</textarea></div>
+    <div class="small muted">Saved with this task on the Clinic Work tab, and the admin sees it next to the task. You can save a note before you tick the box. LASFIR and MRN are enough: don’t type the patient’s name or date of birth. Clearing the box takes the note off this file; a note the admin already has stays.</div>
+    <div class="row" style="margin-top:12px"><button class="btn primary" data-act="seTaskNoteSave" data-k="${esc(key)}">Save note</button><button class="btn" data-act="close">Cancel</button></div>`);
 }
 function vBenefits(){
   if (S.Eerr || !S.E) return seErrCard();
@@ -726,7 +794,7 @@ function seNoteDialog(key){
   const r = S.E.rows.find(x => x.key === key); if (!r) return; const n = S.E.notes.get(key);
   openModal(`<h2>Note · ${seTag(r)} · ${seId(r)}</h2>
     <div class="fld">Note for the admin<textarea id="seNoteText" maxlength="1000">${esc(n ? n.Note : '')}</textarea></div>
-    <div class="small muted">Saved on the Clinic Work tab and sent back with the file. LASFIR and MRN are enough: don’t type the patient’s name or date of birth. Clear the box to remove the note.</div>
+    <div class="small muted">Saved on the Clinic Work tab; the admin picks it up from your clinic’s folder. LASFIR and MRN are enough: don’t type the patient’s name or date of birth. Clear the box to remove the note.</div>
     <div class="row" style="margin-top:12px"><button class="btn primary" data-act="seNoteSave" data-m="${esc(key)}">Save note</button><button class="btn" data-act="close">Cancel</button></div>`);
 }
 function sePayerNoteDialog(name){
@@ -740,8 +808,7 @@ function sePayerNoteDialog(name){
 // a tick or chip re-draws all of #app: put keyboard focus back on the same control (matched by its data-act/k/m/v/p) so a
 // keyboard or screen-reader user keeps their place in the list
 function renderKeepFocus(){
-  const d = document.activeElement && document.activeElement.dataset;
-  const sel = d && d.act ? ['act', 'k', 'm', 'v', 'p'].filter(k => d[k] != null).map(k => `[data-${k}="${String(d[k]).replace(/["\\]/g, '\\$&')}"]`).join('') : '';
+  const sel = actSel(document.activeElement);
   render();
   const el = sel && $('#app').querySelector(sel); if (el) el.focus();
 }
@@ -752,8 +819,11 @@ function seWrite(change){
   const rows = SR.workRows(S.data.work, Object.assign({ By: seBy() }, change), new Date());
   S.data.work = rows; runSE(); renderKeepFocus();
   const aoa = [SR.CLINIC_WORK_COLS].concat(rows.map(x => SR.CLINIC_WORK_COLS.map(c => x[c])));
-  const p = workQ.then(() => S.store.writeSheet(SR.SE_SHEETS.work, aoa, { keepFormat: true, inPlace: true, text: true })); workQ = p.catch(() => {});
-  return p.catch(e => { console.error(e); toast('bad', `Couldn’t save that on the Clinic Work tab: ${esc(e.message || String(e))}. Try again after the refresh.`, 9000); return reload(); });
+  const p = workQ.then(() => S.store.writeSheet(SR.SE_SHEETS.work, aoa, { keepFormat: true, inPlace: true, text: true, table: SE_WORK_TABLE })); workQ = p.catch(() => {});
+  return p.then(r => {
+    // saved, but outside the table the admin's flow reads: say so once a session
+    if (r && r.table && r.table !== 'ok' && !S.seTableWarned){ S.seTableWarned = true; toast('warn', `Saved on the Clinic Work tab. The admin’s inbox reads only the rows inside the Clinic Work table, and ${r.table === 'missing' ? 'this file doesn’t have one' : 'it couldn’t be made bigger'}, so send the saved file to the admin in OneDrive or Teams.`, 12000); }
+  }, e => { console.error(e); toast('bad', `Couldn’t save that on the Clinic Work tab: ${esc(e.message || String(e))}. Try again after the refresh.`, 9000); return reload(); });
 }
 const seRow = key => S.E.rows.find(x => x.key === key) || {};
 function seSetupCard(){
@@ -763,7 +833,7 @@ function seSetupCard(){
   return `<div class="card"><h2>Clinic Eligibility file</h2>
     <div class="small">${esc(se.meta.Location)} · data from ${esc(se.meta['Run Date'])}${S.E ? ` · ${num(S.E.counts.patients)} patients · ${num(S.E.counts.clinicTasks)} open tasks for you` : ''} · ${num(d.work.length)} change${d.work.length === 1 ? '' : 's'} on Clinic Work</div>
     <div class="fld">Your name or initials (goes in By on Clinic Work)<input data-act="seWho" maxlength="60" value="${esc(who)}" placeholder="${esc('Clinic ' + se.meta.Location)}"></div>
-    <div class="small muted">Central Sohar made this file for your clinic. It holds PHI (MRNs, insurance, visits): keep it in MHS OneDrive or Teams only. When you’re done, save it and send it back to the admin there; the admin brings your ticks and notes into Sohar. Don’t edit the hidden tabs.</div>
+    <div class="small muted">Central Sohar made this file for your clinic. It holds PHI (MRNs, insurance, visits): keep it in your clinic’s folder in the Clinic Eligibility library (MHS OneDrive or Teams only). Excel on the web saves your changes on its own and the admin picks them up from there, so you don’t need to send the file back. If the file isn’t in the library, or the admin asks for it, save it and send it to the admin through OneDrive or Teams. Don’t edit the hidden tabs.</div>
     <label class="ck" style="margin-top:8px"><input type="checkbox" data-act="seTemplates"${S.opts.templates === 'On' ? ' checked' : ''}> Show template tools <span class="small muted">(templates, cadence, recall and access; they need a NextGen appointment list)</span></label>
     <div class="small muted" style="margin-top:6px">Clinic Template Tool ${esc(APP_VERSION)} · Sohar file ${esc(se.meta['Sohar Version'])}</div></div>`;
 }
@@ -870,6 +940,9 @@ document.addEventListener('click', async e => {
     else if (act === 'seNote') seNoteDialog(a.dataset.m);
     else if (act === 'sePayerNote') sePayerNoteDialog(a.dataset.p);
     else if (act === 'seNoteSave'){ const r = seRow(a.dataset.m), note = $('#seNoteText').value.trim(); closeModal(); await seWrite({ Kind: 'Note', Key: a.dataset.m, MRN: r.MRN, LASFIR: r.LASFIR, Note: note }); }
+    else if (act === 'seTaskNote') seTaskNoteDialog(a.dataset.k);
+    // no Value: workRows keeps the tick as it is (a note-only row leaves Done alone)
+    else if (act === 'seTaskNoteSave'){ const k = a.dataset.k, r = seRow(k.split('|')[0]), note = $('#seNoteText').value.trim(); closeModal(); await seWrite({ Kind: 'Task done', Key: k, MRN: r.MRN, LASFIR: r.LASFIR, Note: note }); }
     else if (act === 'sePayerNoteSave'){ const card = $('#seCard').value.trim(), note = $('#seNoteText').value.trim(); closeModal(); await seWrite({ Kind: 'Payer note', Key: a.dataset.p, Value: card, Note: note }); }
   } catch (err){ console.error(err); busy(false); toast('bad', esc(err.message || String(err)), 9000); }
 });
