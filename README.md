@@ -17,7 +17,7 @@ Excel add-in for Practice Managers. Put copies of provider templates in a workbo
 | PT ESK Status | ESK Tracker status by LASFIR (active, paused, discontinued, completed). **Recall → Import ESK status** writes it. |
 | Providers | NextGen provider → template label, credential, include. Chairs and rooms are left out automatically. |
 
-Hidden tabs are never read.
+Hidden tabs are never read, except a Clinic Eligibility file's own data tabs (below).
 
 ## What it measures
 
@@ -39,12 +39,26 @@ Late cancels, lead time, release bookings and rebuilt 3NA history need **Cancel 
 
 **Write report tabs** puts the results on `TA ` tabs (counts only, no patient fields). **Recall → Write patient tabs** writes `PT ` tabs that list patients by LASFIR code only (no names or record numbers).
 
+## Clinic Eligibility file (from central Sohar)
+
+Central Sohar Eligibility does every Sohar import, export, discovery and verification. For each clinic the admin saves a **Clinic Eligibility - <Location> YYYY-MM-DD.xlsx** file (Admin tab, **Clinic Template Tool file**) and shares it with that clinic in OneDrive or Teams. Opening it opens this add-in.
+
+- **What's in it**: only the patients whose next visit is at that clinic, their visits, Sohar results and benefits, the admin's build review for them, and what Sohar has learned about the payers they carry. Patient and guarantor names and dates of birth are taken out before the file is made; each patient has a **LASFIR** code (first three letters of the last name, then of the first name, e.g. Jane Smith = SMIJAN) and the MRN. The pane shows patients as LASFIR + MRN only. The file still holds PHI (MRNs, member IDs, insurance, visits): keep it in MHS OneDrive or Teams.
+- **Tabs**: `Read Me` and `Clinic Work` are visible; `SE Info`, `SE Patients`, `SE Results`, `SE Review`, `SE Payers`, `SE Done` and `Payer Credential Rules` are hidden data tabs. Don't edit those. The add-in reads them with Sohar's own `core.js` and `rules.js`, so the list, flags, benefits and tasks match what the admin sees.
+- **What the clinic sees**: **Coverage → Eligibility** (one card per patient by visit day: pills, payer, what to choose in NextGen, Sohar status, copay, deductible and OOP meters, Action/Check items, tasks to tick, Re-verify anyway, a note), **Benefits** (deductible and OOP max met or approaching) and **Payers** (how far each payer's mapping can be trusted, what Sohar found, a payer note). The template tools stay hidden until **Setup → Show template tools** is ticked.
+- **Sending it back**: ticks, re-verify requests and notes are saved on the `Clinic Work` tab (Kind, Key, MRN, LASFIR, Value, Note, By, When; the last row per Kind + Key wins). Save the file and send it back to the admin, who brings it into Sohar (**Bring back clinic files**). Payer notes are for a person to act on; they never change the Payer Map by themselves.
+- The file's data is from its run date. Visits that have passed drop out, and re-verify windows are counted from today. Ask the admin for a new file each week.
+
+Workbooks without an `SE Info` tab work exactly as before.
+
 ## Development
 
-No build step. `engine.js` holds the template analysis and `cadence.js` the cadence, recall and funnel logic (pure functions), `app.js` the UI and Excel calls, `taskpane.html` the page.
+No build step. `engine.js` holds the template analysis and `cadence.js` the cadence, recall and funnel logic (pure functions), `app.js` the UI and Excel calls, `taskpane.html` the page. `core.js`, `rules.js` and `payer-rules.js` are byte-identical copies of the Sohar Eligibility add-in's files (see CLAUDE.md).
 
 ```
-node --test tests/engine.test.js tests/office-store.test.js tests/cadence.test.js
+npm test
 ```
+
+(or `node --test tests/*.js`)
 
 Tests use synthetic data only.
