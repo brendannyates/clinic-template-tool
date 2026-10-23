@@ -69,6 +69,15 @@ function OfficeStore(){
     return out;
   }
   async function sheetFor(ctx, name){ const ws = ctx.workbook.worksheets.getItemOrNullObject(name); await ctx.sync(); if (!ws.isNullObject) return { ws, fresh: false }; return { ws: ctx.workbook.worksheets.add(name), fresh: true }; }
+  // Clinic Work: the sheet keeps the last write per Kind + Key, the admin applies the newest When. When the sheet already has
+  // that Kind + Key at or after this change's When (another PC's clock runs ahead, or this write waited behind a slow one),
+  // restamp the change just after it (max(now, that When + 1 ms)) so both sides pick the same winner.
+  function lastWins(cur, ch){
+    const id = r => `${String(r.Kind ?? '').trim().toLowerCase()}|${String(r.Key ?? '').trim().toLowerCase()}`, mine = id(ch);
+    const prev = Math.max(-Infinity, ...SR.tableObjects(cur).filter(r => id(r) === mine).map(r => Date.parse(String(r.When ?? '').trim())).filter(n => !isNaN(n)));
+    const at = Date.parse(String(ch.When ?? '').trim());
+    return prev < (isNaN(at) ? Date.now() : at) ? ch : Object.assign({}, ch, { When: new Date(Math.max(Date.now(), prev + 1)).toISOString() });
+  }
   // text: '@' on the range in the same batch, before the values, so Excel keeps '0090001' and '=> new card' as typed
   async function writeRows(ctx, ws, aoa, r0 = 0, text = false){
     const w = Math.max(1, ...aoa.map(r => r.length)); const rows = aoa.map(r => { const x = r.slice(); while (x.length < w) x.push(''); return x.map(v => v == null ? '' : text ? String(v) : v); });
@@ -130,28 +139,37 @@ function OfficeStore(){
       return out;
     }),
     // replace a sheet's contents (report and config tabs)
+    // fmt.change (Clinic Work; a plain object with its own When, so full screen relays it as is): two people can work one clinic
+    // file, so the change is applied (SoharRules.workRows, by header name) to the rows on the sheet now, read in this same run,
+    // and aoa is not used. Writing the pane's own copy would drop rows the other person saved since this pane read the sheet.
+    // The result then carries rows: the Clinic Work rows written.
     writeSheet: (name, aoa, fmt = {}) => Excel.run(async ctx => {
       const { ws, fresh } = await sheetFor(ctx, name);
       const keep = fmt.keepFormat && !fresh;     // lookup tabs a PM may have colored: replace values only
+      let merged = null;
+      const apply = cur => { merged = SR.workRows(cur, lastWins(cur, fmt.change)); return [SR.CLINIC_WORK_COLS].concat(merged.map(x => SR.CLINIC_WORK_COLS.map(c => x[c]))); };
+      const done = res => (merged ? Object.assign({}, res, { rows: merged }) : res);
       // inPlace (Clinic Work): write over the old rows first and clear what is left below only after that, so a failed write keeps them
       if (fmt.inPlace && !fresh){
         const u = ws.getUsedRangeOrNullObject(true); u.load('rowIndex,rowCount,columnIndex,columnCount'); await ctx.sync();
-        const w = await writeRows(ctx, ws, aoa, 0, fmt.text);
         const rows = u.isNullObject ? 0 : u.rowIndex + u.rowCount, cols = u.isNullObject ? 0 : u.columnIndex + u.columnCount;
+        if (fmt.change) aoa = apply(rows ? await readBig(ctx, ws, rows, cols, 500) : []);
+        const w = await writeRows(ctx, ws, aoa, 0, fmt.text);
         if (rows > aoa.length) ws.getRangeByIndexes(aoa.length, 0, rows - aoa.length, Math.max(cols, w)).clear('Contents');
         if (cols > w && aoa.length) ws.getRangeByIndexes(0, w, Math.min(rows, aoa.length), cols - w).clear('Contents');
         await ctx.sync();
-        return fmt.table ? fitTable(ctx, ws, fmt.table, aoa, w).catch(e => { console.warn(e); return { table: 'short' }; }) : undefined;
+        return done(fmt.table ? await fitTable(ctx, ws, fmt.table, aoa, w).catch(e => { console.warn(e); return { table: 'short' }; }) : undefined);
       }
+      if (fmt.change) aoa = apply([]);   // a new sheet has no rows yet
       ws.getRange().clear(keep ? 'Contents' : undefined); await ctx.sync();
       const w = await writeRows(ctx, ws, aoa, 0, fmt.text);
-      if (keep){ await ctx.sync(); return; }
+      if (keep){ await ctx.sync(); return done(undefined); }
       const hdr = ws.getRangeByIndexes(0, 0, 1, w); hdr.format.font.bold = true; hdr.format.fill.color = '#DCEFED';
       for (const [c, f] of Object.entries(fmt.numFmt || {})) if (aoa.length > 1) ws.getRangeByIndexes(1, +c, aoa.length - 1, 1).numberFormat = Array.from({ length: aoa.length - 1 }, () => [f]);
       ws.freezePanes.freezeRows(1);
       try { ws.getRangeByIndexes(0, 0, Math.min(aoa.length, 400), w).format.autofitColumns(); } catch {}
       await ctx.sync();
-      return fmt.table ? { table: 'missing' } : undefined;   // a sheet made here has no table
+      return done(fmt.table ? { table: 'missing' } : undefined);   // a sheet made here has no table
     }),
     replaceAppts: (sheetName, aoa, dateCol) => Excel.run(async ctx => {
       const { ws } = await sheetFor(ctx, sheetName || SHEETS.appt); ws.getRange().clear(); await ctx.sync();
@@ -724,19 +742,22 @@ function ptCard(r, T){
     <div class="pt-act"><button class="btn sm" data-act="seNote" data-m="${k}">${note ? 'Edit note' : 'Add note'}</button></div>
   </div>`;
 }
-// a clinic task: the Done tick, and next to it the done note (the Note on the task's Clinic Work "Task done" row)
+// a clinic task: the Done tick, and next to it the done note (the Note on the task's Clinic Work "Task done" row). Under it, the
+// task's Clinic Note on the admin's NextGen Tasks when the file was made (sentNote, from SE Done): what the admin already has.
+const seSentHTML = t => (t.sentNote ? `<div class="small tnote"><span class="muted">The admin has this note:</span> ${esc(t.sentNote)}</div>` : '');
 function seTaskHTML(t){
   const tk = esc(t['Task Key']), m = esc(String(t['Task Key'] || '').split('|')[0]);
   return `<div class="task"><label class="ck"><input type="checkbox" data-act="seDone" data-k="${tk}" data-m="${m}"${t.Done ? ' checked' : ''}${t.doneBy === 'admin' ? ' disabled' : ''}><span><b>${esc(t.Task)}</b>${t.Details ? ` <span class="small muted">${esc(t.Details)}</span>` : ''}${t.doneBy === 'admin' ? ' <span class="chip ok">Done by the admin</span>' : ''}</span></label>
     <button class="btn sm" data-act="seTaskNote" data-k="${tk}" data-m="${m}" aria-label="${esc((t.clinicNote ? 'Edit the done note for ' : 'Add a done note for ') + t.Task)}">${t.clinicNote ? 'Edit note' : 'Note'}</button></div>
-    ${t.clinicNote ? `<div class="small tnote"><span class="muted">Your note:</span> ${esc(t.clinicNote)}</div>` : ''}`;
+    ${seSentHTML(t)}${t.clinicNote ? `<div class="small tnote"><span class="muted">Your note:</span> ${esc(t.clinicNote)}</div>` : ''}`;
 }
 function seTaskNoteDialog(key){
   const t = S.E.tasks.find(x => x['Task Key'] === key), r = t && seRow(String(key).split('|')[0]); if (!t || !r.key) return;
   openModal(`<h2>Done note · ${seTag(r)} · ${seId(r)}</h2>
     <div class="small"><b>${esc(t.Task)}</b>${t.Details ? ` <span class="muted">${esc(t.Details)}</span>` : ''}</div>
+    ${seSentHTML(t)}
     <div class="fld">What you did<textarea id="seNoteText" maxlength="500" placeholder="${esc('For example: called the patient, new card scanned')}">${esc(t.clinicNote || '')}</textarea></div>
-    <div class="small muted">Saved with this task on the Clinic Work tab, and the admin sees it next to the task. You can save a note before you tick the box. LASFIR and MRN are enough: don’t type the patient’s name or date of birth. Clearing the box takes the note off this file; a note the admin already has stays.</div>
+    <div class="small muted">Saved with this task on the Clinic Work tab, and the admin sees it next to the task. You can save a note before you tick the box. LASFIR and MRN are enough: don’t type the patient’s name or date of birth. ${t.sentNote ? 'A new note takes the place of the admin’s note above once it reaches them. ' : ''}Clearing the box takes the note off this file; a note the admin already has stays.</div>
     <div class="row" style="margin-top:12px"><button class="btn primary" data-act="seTaskNoteSave" data-k="${esc(key)}">Save note</button><button class="btn" data-act="close">Cancel</button></div>`);
 }
 function vBenefits(){
@@ -812,15 +833,21 @@ function renderKeepFocus(){
   render();
   const el = sel && $('#app').querySelector(sel); if (el) el.focus();
 }
-// Clinic Work: the whole small sheet is rewritten on each change (last row per Kind + Key wins); writes run one at a time
+// Clinic Work: the whole small sheet is rewritten on each change (last row per Kind + Key wins); writes run one at a time.
+// The list updates at once from this pane's copy; writeSheet applies the same change to the rows on the sheet at write time
+// (someone else may have saved since) and hands them back.
 let workQ = Promise.resolve();
 function seBy(){ let n = ''; try { n = localStorage.getItem('ctWho') || ''; } catch {} return n.trim() || `Clinic ${S.SE.meta.Location}`; }
 function seWrite(change){
-  const rows = SR.workRows(S.data.work, Object.assign({ By: seBy() }, change), new Date());
+  // When stamped once here, so this copy and the rows written at the sheet match (writeSheet restamps it only when the sheet
+  // already has a later When for the same Kind + Key; the rows then differ and come back below)
+  const ch = Object.assign({ By: seBy(), When: new Date().toISOString() }, change);
+  const rows = SR.workRows(S.data.work, ch);
   S.data.work = rows; runSE(); renderKeepFocus();
-  const aoa = [SR.CLINIC_WORK_COLS].concat(rows.map(x => SR.CLINIC_WORK_COLS.map(c => x[c])));
-  const p = workQ.then(() => S.store.writeSheet(SR.SE_SHEETS.work, aoa, { keepFormat: true, inPlace: true, text: true, table: SE_WORK_TABLE })); workQ = p.catch(() => {});
+  const p = workQ.then(() => S.store.writeSheet(SR.SE_SHEETS.work, null, { keepFormat: true, inPlace: true, text: true, table: SE_WORK_TABLE, change: ch })); workQ = p.catch(() => {});
   return p.then(r => {
+    // the sheet had rows this pane hadn't seen: show them. Skipped while a later change is on its way (its write hands back newer rows).
+    if (r && Array.isArray(r.rows) && S.data.work === rows && JSON.stringify(r.rows) !== JSON.stringify(rows)){ S.data.work = r.rows; runSE(); renderKeepFocus(); }
     // saved, but outside the table the admin's flow reads: say so once a session
     if (r && r.table && r.table !== 'ok' && !S.seTableWarned){ S.seTableWarned = true; toast('warn', `Saved on the Clinic Work tab. The admin’s inbox reads only the rows inside the Clinic Work table, and ${r.table === 'missing' ? 'this file doesn’t have one' : 'it couldn’t be made bigger'}, so send the saved file to the admin in OneDrive or Teams.`, 12000); }
   }, e => { console.error(e); toast('bad', `Couldn’t save that on the Clinic Work tab: ${esc(e.message || String(e))}. Try again after the refresh.`, 9000); return reload(); });

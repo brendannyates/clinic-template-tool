@@ -94,12 +94,19 @@ function loadApp(Excel, extra){
   const fire = (k, e) => Promise.all((on[k] || []).map(f => f(e)));
   return { api: sandbox.__api, els, doc: sandbox.document, fire };
 }
-// an app whose store is the mock workbook (load) plus a writeSheet log
+// an app whose store is the mock workbook (load) plus a writeSheet log. A Clinic Work change goes onto the rows on the sheet
+// (the last write), as OfficeStore does it; the log holds what was written and the rows come back.
 async function appWith(sheets){
   const { Excel, reads } = mockBook(sheets); const { api, els, doc, fire } = loadApp(Excel);
   const writes = [], docs = {};
   const office = api.OfficeStore();
-  api.S.store = { live: true, load: office.load, writeSheet: async (n, aoa, fmt) => { writes.push([n, aoa, fmt]); }, getDoc: k => docs[k] ?? null, setDoc: async (k, v) => { docs[k] = v; } };
+  let work = (sheets.find(s => s.name === 'Clinic Work') || {}).rows || [];
+  const writeSheet = async (n, aoa, fmt) => {
+    if (!(fmt && fmt.change)){ writes.push([n, aoa, fmt]); return; }
+    const rows = R.workRows(work, fmt.change); work = [R.CLINIC_WORK_COLS].concat(rows.map(x => R.CLINIC_WORK_COLS.map(c => x[c])));
+    writes.push([n, work, fmt]); return { table: 'ok', rows };
+  };
+  api.S.store = { live: true, load: office.load, writeSheet, getDoc: k => docs[k] ?? null, setDoc: async (k, v) => { docs[k] = v; } };
   await api.reload();
   return { api, els, doc, writes, docs, reads, fire };
 }
@@ -320,7 +327,11 @@ function tableSheet(rows, tbl, o = {}){
   let q = [], n = 0;
   const range = (r0, c0, h, w) => {
     const each = (v, fn) => { assert.ok(v.length === h && v.every(x => x.length === w), `array must be ${h}×${w}`); v.forEach((x, i) => x.forEach((y, j) => fn(cell(r0 + i, c0 + j), y))); };
-    return { _b: { r0, c0, h, w }, set numberFormat(v){ q.push(() => each(v, (c, y) => { c.f = y; })); }, set values(v){ q.push(() => each(v, (c, y) => { c.v = parse(y, c.f); })); },
+    // a read: load, then the values as they are once that sync has run
+    let got = null;
+    return { _b: { r0, c0, h, w }, load(){ q.push(() => { got = Array.from({ length: h }, (_, i) => Array.from({ length: w }, (_, j) => (g[r0 + i] && g[r0 + i][c0 + j] ? g[r0 + i][c0 + j].v : ''))); }); },
+      get values(){ assert.ok(got, 'values read before a sync'); return got; },
+      set numberFormat(v){ q.push(() => each(v, (c, y) => { c.f = y; })); }, set values(v){ q.push(() => each(v, (c, y) => { c.v = parse(y, c.f); })); },
       clear(a){ q.push(() => { for (let i = 0; i < h; i++) for (let j = 0; j < w; j++) { const c = cell(r0 + i, c0 + j); c.v = ''; if (a !== 'Contents') c.f = 'General'; } }); } };
   };
   const used = () => { const u = g.map((r, i) => [i, r.reduce((m, c, j) => (c.v !== '' ? j + 1 : m), 0)]).filter(x => x[1]);
@@ -456,6 +467,154 @@ test('full screen: the table option goes through the relay and the result comes 
   assert.deepEqual(msg.args, [ 'Clinic Work', plainRows(aoa), FMT ]);
   rx({ message: JSON.stringify({ c: 'r1', i: 0, n: 1, d: JSON.stringify({ rid: msg.rid, ok: true, res: { table: 'short' } }) }) });
   assert.equal((await p).table, 'short');
+  // the Clinic Work change is plain JSON: it crosses the relay unchanged, and the rows on the sheet come back
+  const fmt = Object.assign({ change: Object.assign({ When: NOW.toISOString() }, CHANGES[0]) }, FMT);
+  assert.deepEqual(plainRows(fmt), fmt, 'nothing lost to JSON');
+  sent.length = 0;
+  const p2 = rs.writeSheet('Clinic Work', null, fmt);
+  const msg2 = JSON.parse(sent.map(s => JSON.parse(s)).sort((x, y) => x.i - y.i).map(x => x.d).join(''));
+  assert.deepEqual(msg2.args, ['Clinic Work', null, fmt]);
+  const rows = R.workRows([], CHANGES[0], NOW);
+  rx({ message: JSON.stringify({ c: 'r2', i: 0, n: 1, d: JSON.stringify({ rid: msg2.rid, ok: true, res: { table: 'ok', rows } }) }) });
+  assert.deepEqual(plainRows((await p2).rows), plainRows(rows));
+});
+
+// two panes (two staff) on one clinic file: each pane reads the file once, then keeps working from its own copy
+async function paneOn(sh, pack){
+  const a = await appWith(bookOf(pack));
+  a.api.S.store.writeSheet = loadApp(sh.Excel).api.OfficeStore().writeSheet;
+  return a.api;
+}
+const cw = rows => R.tableObjects(rows).map(r => [r.Kind, r.Key, r.Value, r.Note, r.By]);
+
+test('two people in one clinic file: each change goes onto the rows on the sheet now, so neither wipes out the other', async () => {
+  const { src } = adminSrc();
+  const pack = R.clinicPack(LOC, src);
+  const sh = tableSheet([R.CLINIC_WORK_COLS], { rows: 2 });   // as Sohar exports it
+  const A = await paneOn(sh, pack), B = await paneOn(sh, pack);
+  const ben = A.S.E.tasks.find(t => t.MRN === '900001' && t.Task === 'Update benefits in NextGen')['Task Key'];
+  const rv = (by, v) => wr('Re-verify anyway', '900001', { Value: v, By: by });
+  // Ana first: nothing new on the sheet, so her list is left as it was drawn
+  const pa = A.seWrite(rv('Ana', 'On')); const mineA = A.S.data.work; await pa;
+  assert.equal(A.S.data.work, mineA, 'no unseen rows: no second re-draw');
+  // Ben's pane never saw Ana's tick; his note goes onto the sheet beside it
+  const pb = B.seWrite(wr('Note', '900002', { Note: 'New card at check-in', By: 'Ben' })); const mineB = B.S.data.work;
+  assert.equal(mineB.length, 1, 'Ben’s own copy has only his note');
+  await pb;
+  assert.deepEqual(cw(sh.values()), [['Re-verify anyway', '900001', 'On', '', 'Ana'], ['Note', '900002', '', 'New card at check-in', 'Ben']], 'Ana’s tick survived Ben’s save');
+  assert.notEqual(B.S.data.work, mineB);
+  assert.deepEqual(cw(B.S.data.work), cw(sh.values()), 'Ben now sees Ana’s row');
+  assert.equal(B.S.E.rows.find(r => r.key === '900001')['Re-verify Anyway'], 'Yes', 'and his list shows it');
+  // interleaved: Ana ticks a task; Ben (whose copy has no tick) adds a done note to it; the tick stays, from the sheet
+  await A.seWrite(wr('Task done', ben, { Value: 'Yes', By: 'Ana' }));
+  await B.seWrite(wr('Task done', ben, { Note: 'Called the patient', By: 'Ben' }));
+  const aTask = () => A.S.E.tasks.find(t => t['Task Key'] === ben);
+  assert.deepEqual([aTask().Done, aTask().clinicNote], ['Yes', ''], 'Ana’s pane hasn’t seen Ben’s note yet');
+  // same Kind + Key: the last writer wins, and there is still one row for it
+  await A.seWrite(rv('Ana', 'Off'));
+  assert.deepEqual([aTask().Done, aTask().clinicNote], ['Yes', 'Called the patient'], 'her next save brings in Ben’s rows');
+  await B.seWrite(rv('Ben', 'On'));
+  const want = [['Note', '900002', '', 'New card at check-in', 'Ben'], ['Task done', ben, 'Yes', 'Called the patient', 'Ben'], ['Re-verify anyway', '900001', 'On', '', 'Ben']];
+  assert.deepEqual(cw(sh.values()), want);
+  assert.deepEqual(sh.inTable(), sh.values(), 'every row inside tblClinicWork for the admin’s flow');
+  assert.ok(sh.formats().slice(0, 4).every(r => r.slice(0, 8).every(f => f === '@')), 'as text');
+  assert.deepEqual(cw(B.S.data.work), want);
+  assert.equal(A.S.E.rows.find(r => r.key === '900001')['Re-verify Anyway'], '', 'Ana still shows her own Off');
+  await A.seWrite(wr('Payer note', 'Cigna', { Value: 'Cigna Open Access Plus', By: 'Ana' }));
+  assert.equal(A.S.E.rows.find(r => r.key === '900001')['Re-verify Anyway'], 'Yes', 'until her next save brings in Ben’s On');
+  // what the admin gets back holds both people's changes
+  const m = R.mergeClinicWork(sh.inTable(), { location: LOC, requests: [], tasks: src.tasks, sentDone: B.S.SE.done, notes: [], payerNotes: [] });
+  assert.deepEqual([m.done.get(ben), m.doneNotes.get(ben).split(' (')[0], m.notes.length, m.payerNotes.length], [`Yes (clinic ${LOC})`, 'Called the patient', 1, 1]);
+});
+
+test('two people, same Kind + Key, the later save carrying the earlier When: the sheet and the admin pick the same winner', async () => {
+  const { src } = adminSrc();
+  const pack = R.clinicPack(LOC, src);
+  const sh = tableSheet([R.CLINIC_WORK_COLS], { rows: 2 });
+  const A = await paneOn(sh, pack), B = await paneOn(sh, pack);
+  const rv = (by, v, when) => wr('Re-verify anyway', '900001', Object.assign({ Value: v, By: by }, when ? { When: when } : {}));
+  const row = () => R.tableObjects(sh.values()).find(r => r.Kind === 'Re-verify anyway');
+  // Ben's PC clock runs 5 s ahead; his On lands first, and the admin's flow reads the file before Ana saves
+  const benWhen = new Date(Date.now() + 5000).toISOString();
+  await B.seWrite(rv('Ben', 'On', benWhen));
+  const inbox = R.tableObjects(sh.inTable()).map(r => Object.assign({ Location: LOC, File: `Clinic Eligibility - ${LOC}.xlsx`, Received: new Date().toISOString() }, r));
+  const merge = (rows, prev) => R.mergeClinicWork(R.inboxWork(rows, new Date()).get(LOC), Object.assign({ location: LOC, requests: [], tasks: src.tasks, sentDone: B.S.SE.done, notes: [], payerNotes: [], now: new Date() }, prev || {}));
+  const asked = m => m.requests.some(r => r.MRN === '900001');   // a Re-verify Requests row
+  const m1 = merge(inbox);
+  assert.equal(asked(m1), true);
+  // Ana's Off is stamped now, before Ben's When, but it is the last write: the sheet keeps it, restamped just after Ben's
+  const pa = A.seWrite(rv('Ana', 'Off')); const mine = A.S.data.work;
+  const anaWhen = mine.find(r => r.Kind === 'Re-verify anyway').When;
+  assert.ok(anaWhen < benWhen, 'her pane stamped the earlier When');
+  await pa;
+  assert.deepEqual([row().Value, row().By], ['Off', 'Ana'], 'last writer wins on the sheet');
+  assert.ok(Date.parse(row().When) > Date.parse(benWhen), 'and its When is now after Ben’s');
+  assert.notEqual(A.S.data.work, mine, 'the restamped row came back to her pane');
+  assert.deepEqual(A.S.data.work.find(r => r.Kind === 'Re-verify anyway'), row());
+  // the flow appends Ana's row too (a new Kind|Key|When); the admin applies it after Ben's, so it agrees with the sheet
+  inbox.push(Object.assign({ Location: LOC, File: `Clinic Eligibility - ${LOC}.xlsx`, Received: new Date().toISOString() }, row()));
+  const m2 = merge(inbox, { requests: m1.requests, applied: m1.applied });
+  assert.deepEqual([asked(m2), m2.counts.reverifyRemoved], [false, 1], 'Ana’s Off is the newest When, so it applies');
+  assert.equal(asked(merge(inbox)), false, 'a fresh admin reading both rows gets Off too');
+  // Ben's pane: his next save brings in Ana's Off
+  await B.seWrite(wr('Note', '900002', { Note: 'New card at check-in', By: 'Ben' }));
+  assert.equal(B.S.E.rows.find(r => r.key === '900001')['Re-verify Anyway'], '');
+});
+
+test('a Clinic Work change reads the sheet by header name, and a failed write still leaves the earlier rows', async () => {
+  // columns in another order: each row is read by its header and written back in CLINIC_WORK_COLS order
+  const odd = R.CLINIC_WORK_COLS.slice().reverse();
+  const note = { When: '2026-10-20T10:05:00.000Z', By: 'Ben', Note: 'New card at check-in', Value: '', LASFIR: 'BRABRA', MRN: '900002', Key: '900002', Kind: 'Note' };
+  const sh = tableSheet([odd, odd.map(c => note[c])], { rows: 2 });
+  const fmt = Object.assign({ change: Object.assign({ When: NOW.toISOString() }, CHANGES[2]) }, FMT);
+  const res = await loadApp(sh.Excel).api.OfficeStore().writeSheet('Clinic Work', null, fmt);
+  assert.equal(res.table, 'ok');
+  assert.deepEqual(cw(res.rows), [['Note', '900002', '', 'New card at check-in', 'Ben'], ['Re-verify anyway', '900002', 'On', '', 'Clinic San Rafael']]);
+  assert.deepEqual(sh.inTable(), workAoa(res.rows));
+  assert.equal(res.rows[1].When, NOW.toISOString(), 'the change’s own When, so the pane’s copy and the sheet match');
+  // sync 1 finds the sheet, 2 its size, 3 reads the rows, 4 writes: a failed write changes nothing
+  const before = workAoa(R.workRows([], CHANGES.slice(0, 2), NOW));
+  const b = tableSheet(before, { rows: 3 }, { failSync: n => n === 4 });
+  await assert.rejects(loadApp(b.Excel).api.OfficeStore().writeSheet('Clinic Work', null, fmt), /RequestThrottled/);
+  assert.deepEqual([b.values(), b.table().rows], [before, 3]);
+});
+
+test('done notes back from the admin: each task shows the note the admin has, in plain words, and the clinic can still add its own', async () => {
+  const { src, fixKey } = adminSrc();
+  const ben = src.tasks.find(t => t.MRN === '900001' && t.Task === 'Update benefits in NextGen')['Task Key'];
+  // a bring-back wrote one Clinic Note (it quotes the patient's name); the admin typed the other
+  const notes = { [ben]: 'called Testa Quillfeather, new card scanned (Front desk, San Rafael, 10/21)', [fixKey]: 'billing has the new card' };
+  const tasks = src.tasks.map(t => (notes[t['Task Key']] ? Object.assign({}, t, { 'Clinic Note': notes[t['Task Key']] }) : t));
+  const pack = R.clinicPack(LOC, Object.assign({}, src, { tasks }));
+  const { api, els, writes, fire } = await appWith(bookOf(pack));
+  const S = api.S, task = k => S.E.tasks.find(t => t['Task Key'] === k);
+  const sent = 'called QUITES, new card scanned (Front desk, San Rafael, 10/21)';
+  assert.deepEqual([task(ben).sentNote, task(ben).clinicNote, task(ben).Done], [sent, '', ''], 'a note alone doesn’t tick the task');
+  S.view = 'eligibility'; api.render(); let html = els['#app'].innerHTML;
+  assert.ok(html.includes(`The admin has this note:</span> ${sent}`));
+  assert.ok(html.includes('The admin has this note:</span> billing has the new card'), 'on a task the admin did too');
+  for (const s of NEVER) assert.ok(!html.includes(s), `"${s}" is not on the list`);
+  assert.ok(html.includes(`data-k="${ben}" data-m="900001" aria-label="Add a done note for Update benefits in NextGen">Note</button>`), 'the clinic can still add a note');
+  // the dialog shows the admin's note and starts empty
+  await fire('click', { target: { closest: s => (s === '[data-act]' ? { tagName: 'BUTTON', dataset: { act: 'seTaskNote', k: ben } } : null) } });
+  const dlg = els['#sheet'].innerHTML;
+  assert.ok(dlg.includes(`The admin has this note:</span> ${sent}`) && dlg.includes('A new note takes the place of the admin’s note above'));
+  assert.match(dlg, /<textarea[^>]*><\/textarea>/);
+  for (const s of NEVER) assert.ok(!dlg.includes(s), `"${s}" is not in the dialog`);
+  els['#seNoteText'] = { value: 'card photo emailed too' };
+  await fire('click', { target: { closest: s => (s === '[data-act]' ? { tagName: 'BUTTON', dataset: { act: 'seTaskNoteSave', k: ben } } : null) } });
+  assert.deepEqual([task(ben).sentNote, task(ben).clinicNote], [sent, 'card photo emailed too'], 'side by side; neither replaces the other');
+  const row = R.tableObjects(writes[writes.length - 1][1]).find(r => r.Kind === 'Task done' && r.Key === ben);
+  assert.deepEqual([row.Value, row.Note], ['', 'card photo emailed too']);
+  html = els['#app'].innerHTML;
+  assert.ok(html.indexOf('The admin has this note:') < html.indexOf('Your note:</span> card photo emailed too'));
+  // a file made before SE Done had the Clinic Note column: no admin note line, Done as before
+  const old = bookOf(pack).map(s => (s.name === 'SE Done' ? Object.assign({}, s, { rows: s.rows.map(r => r.slice(0, 2)) }) : s));
+  assert.deepEqual(old.find(s => s.name === 'SE Done').rows[0], ['Task Key', 'Done']);
+  const o = await appWith(old);
+  o.api.S.view = 'eligibility'; o.api.render();
+  assert.ok(!o.els['#app'].innerHTML.includes('The admin has this note'));
+  assert.equal(o.api.S.E.tasks.find(t => t['Task Key'] === fixKey).doneBy, 'admin');
 });
 
 test('done notes: a Note button by each clinic task; a note keeps the tick, a tick keeps the note, and the admin gets it from the file or the inbox', async () => {
