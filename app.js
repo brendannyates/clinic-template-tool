@@ -1,5 +1,8 @@
 // Clinic Template Tool: Excel add-in front end. Analysis lives in engine.js (TE).
+// Clinic Eligibility files use Sohar's own core.js / rules.js (SoharCore / SoharRules, byte-identical copies).
 'use strict';
+const APP_VERSION = '1.1.0';   // bump with every ?v= in taskpane.html
+const SC = SoharCore, SR = SoharRules;
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const pct = (x, d = 0) => x == null || isNaN(x) ? '—' : (x * 100).toFixed(d) + '%';
@@ -8,38 +11,105 @@ const days = x => x == null ? '—' : x + (x === 1 ? ' day' : ' days');
 
 const SHEETS = { appt: 'Appointment List', ref: 'Ref', st: 'Slot Types', prov: 'Providers', hist: 'TA 3NA History', eskst: 'PT ESK Status', pcr: 'Payer Credential Rules' };
 const OUT_PREFIX = 'TA ', PT_PREFIX = 'PT ';   // TA tabs are counts only; PT tabs list patients by LASFIR code
-const VIEWS = [['overview', 'Overview'], ['templates', 'Templates'], ['access', 'Access'], ['cadence', 'Cadence'], ['funnel', 'Funnel'], ['recall', 'Recall'], ['visits', 'Visits'], ['impact', 'Provider impact'], ['trends', 'Trends'], ['setup', 'Setup']];
-const S = { view: 'overview', data: null, R: null, f: { from: '', to: '', loc: '', prov: '', sl: '' }, opts: { lateHours: 24, target: 14, asOf: '', releaseHours: 24, convDays: 90, lapsedDays: 60, overdueMult: 1.5, tmsCount: 30, maintDays: 180, matchDays: 10, dayStart: '08:00', dayEnd: '18:00' }, heatMetric: 'fill', trendType: '', impactWhy: '', recallState: 'call', store: null, mode: 'pane', full: false };
+const VIEWS = [['overview', 'Overview'], ['templates', 'Templates'], ['access', 'Access'], ['cadence', 'Cadence'], ['funnel', 'Funnel'], ['recall', 'Recall'], ['visits', 'Visits'], ['impact', 'Provider impact'], ['trends', 'Trends'], ['eligibility', 'Eligibility'], ['benefits', 'Benefits'], ['payers', 'Payers'], ['setup', 'Setup']];
+const VIEW_LABEL = Object.fromEntries(VIEWS);
+// top tabs; a group with more than one visible view gets a sub-tab row
+const NAV = [['schedule', 'Schedule', ['overview', 'templates', 'impact', 'trends', 'visits']], ['patients', 'Patients', ['cadence', 'funnel', 'recall']], ['coverage', 'Coverage', ['eligibility', 'benefits', 'payers', 'access']], ['setup', 'Setup', ['setup']]];
+const SE_VIEWS = ['eligibility', 'benefits', 'payers'];   // need a Clinic Eligibility file; every other view but Setup needs the appointment list
+const SE_WORK_TABLE = 'tblClinicWork';   // the Clinic Work table Sohar's clinicPack makes; the admin's Power Automate flow reads it
+const AUTO_SHOW = 'Office.AutoShowTaskpaneWithDocument';
+const S = { view: 'overview', data: null, R: null, f: { from: '', to: '', loc: '', prov: '', sl: '' }, opts: { lateHours: 24, target: 14, asOf: '', releaseHours: 24, convDays: 90, lapsedDays: 60, overdueMult: 1.5, tmsCount: 30, maintDays: 180, matchDays: 10, dayStart: '08:00', dayEnd: '18:00' }, heatMetric: 'fill', trendType: '', impactWhy: '', recallState: 'call', store: null, mode: 'pane', full: false,
+  SE: null, E: null, sub: {}, sePill: '', seQ: '', seBen: '' };
 
 // ---------- small UI helpers ----------
 function toast(kind, html, ms = 5000){ const d = document.createElement('div'); d.className = 'msg ' + kind; d.innerHTML = html; $('#toast').appendChild(d); setTimeout(() => d.remove(), ms); }
 function busy(on, msg){ $('#busy').hidden = !on; if (msg) $('#busyMsg').textContent = msg; }
-function openModal(html){ $('#sheet').innerHTML = html; $('#modal').hidden = false; }
-function closeModal(){ $('#modal').hidden = true; $('#sheet').innerHTML = ''; const r = askRes; askRes = null; if (r) r(false); }
+// a control's data-act/k/m/v/p as a selector, so it can be found again after #app is re-drawn
+function actSel(el){ const d = el && el.dataset; return d && d.act ? ['act', 'k', 'm', 'v', 'p'].filter(k => d[k] != null).map(k => `[data-${k}="${String(d[k]).replace(/["\\]/g, '\\$&')}"]`).join('') : ''; }
+// the dialog takes keyboard focus (its first field, else first button, or `first`) and closing it puts focus back on the
+// control that opened it, found again by actSel (a Save re-draws #app); otherwise focus falls to the top of the page
+let modalFrom = '';
+const FOCUSABLE = 'textarea, input, select, button';
+function openModal(html, first){
+  if ($('#modal').hidden) modalFrom = actSel(document.activeElement);
+  $('#sheet').innerHTML = html; $('#modal').hidden = false;
+  const el = (first && $('#sheet').querySelector(first)) || $('#sheet').querySelector(FOCUSABLE); if (el) el.focus();
+}
+function closeModal(){
+  $('#modal').hidden = true; $('#sheet').innerHTML = ''; const r = askRes; askRes = null;
+  const sel = modalFrom; modalFrom = ''; const el = sel && $('#app').querySelector(sel); if (el) el.focus();
+  if (r) r(false);
+}
 // Office add-ins block window.confirm, so yes/no questions use the in-pane modal. Closing it any other way = Cancel.
 let askRes = null;
 function ask(html, ok = 'Continue'){
   return new Promise(res => {
-    openModal(`<h2>Please confirm</h2><div>${html}</div><div class="row" style="margin-top:12px"><button class="btn primary" data-act="askYes">${esc(ok)}</button><button class="btn" data-act="askNo">Cancel</button></div>`);
+    // focus starts on Cancel: these confirm a replace, so Enter alone should not do it
+    openModal(`<h2>Please confirm</h2><div>${html}</div><div class="row" style="margin-top:12px"><button class="btn primary" data-act="askYes">${esc(ok)}</button><button class="btn" data-act="askNo">Cancel</button></div>`, '[data-act="askNo"]');
     askRes = res;
   });
 }
 $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
-document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#modal').hidden) closeModal(); });
+// Tab and Shift+Tab stay inside an open dialog (aria-modal alone does not keep them there)
+document.addEventListener('keydown', e => {
+  if ($('#modal').hidden) return;
+  if (e.key === 'Escape') return closeModal();
+  if (e.key !== 'Tab') return;
+  const f = Array.from($('#sheet').querySelectorAll(FOCUSABLE)).filter(x => !x.disabled); if (!f.length) return;
+  const i = f.indexOf(document.activeElement), j = e.shiftKey ? (i <= 0 ? f.length - 1 : i - 1) : (i < 0 || i === f.length - 1 ? 0 : i + 1);
+  e.preventDefault(); f[j].focus();
+});
 
 // ---------- workbook access ----------
 function OfficeStore(){
   const CHUNK = 2500;
-  async function readBig(ctx, ws, rows, cols){
+  async function readBig(ctx, ws, rows, cols, chunk = CHUNK){
     const out = [];
-    for (let r = 0; r < rows; r += CHUNK){ const g = ws.getRangeByIndexes(r, 0, Math.min(CHUNK, rows - r), cols); g.load('values'); await ctx.sync(); out.push(...g.values); }
+    for (let r = 0; r < rows; r += chunk){ const g = ws.getRangeByIndexes(r, 0, Math.min(chunk, rows - r), cols); g.load('values'); await ctx.sync(); out.push(...g.values); }
     return out;
   }
   async function sheetFor(ctx, name){ const ws = ctx.workbook.worksheets.getItemOrNullObject(name); await ctx.sync(); if (!ws.isNullObject) return { ws, fresh: false }; return { ws: ctx.workbook.worksheets.add(name), fresh: true }; }
-  async function writeRows(ctx, ws, aoa, r0 = 0){
-    const w = Math.max(1, ...aoa.map(r => r.length)); const rows = aoa.map(r => { const x = r.slice(); while (x.length < w) x.push(''); return x.map(v => v == null ? '' : v); });
-    for (let i = 0; i < rows.length; i += 1000){ const part = rows.slice(i, i + 1000); ws.getRangeByIndexes(r0 + i, 0, part.length, w).values = part; await ctx.sync(); }
+  // Clinic Work: the sheet keeps the last write per Kind + Key, the admin applies the newest When. When the sheet already has
+  // that Kind + Key at or after this change's When (another PC's clock runs ahead, or this write waited behind a slow one),
+  // restamp the change just after it (max(now, that When + 1 ms)) so both sides pick the same winner.
+  function lastWins(cur, ch){
+    const id = r => `${String(r.Kind ?? '').trim().toLowerCase()}|${String(r.Key ?? '').trim().toLowerCase()}`, mine = id(ch);
+    const prev = Math.max(-Infinity, ...SR.tableObjects(cur).filter(r => id(r) === mine).map(r => Date.parse(String(r.When ?? '').trim())).filter(n => !isNaN(n)));
+    const at = Date.parse(String(ch.When ?? '').trim());
+    return prev < (isNaN(at) ? Date.now() : at) ? ch : Object.assign({}, ch, { When: new Date(Math.max(Date.now(), prev + 1)).toISOString() });
+  }
+  // text: '@' on the range in the same batch, before the values, so Excel keeps '0090001' and '=> new card' as typed
+  async function writeRows(ctx, ws, aoa, r0 = 0, text = false){
+    const w = Math.max(1, ...aoa.map(r => r.length)); const rows = aoa.map(r => { const x = r.slice(); while (x.length < w) x.push(''); return x.map(v => v == null ? '' : text ? String(v) : v); });
+    for (let i = 0; i < rows.length; i += 1000){ const part = rows.slice(i, i + 1000); const g = ws.getRangeByIndexes(r0 + i, 0, part.length, w); if (text) g.numberFormat = part.map(r => r.map(() => '@')); g.values = part; await ctx.sync(); }
     return w;
+  }
+  // fmt.table (Clinic Work): Power Automate's "List rows present in a table" sees only rows inside the table, so after the
+  // in-place write the table grows to header + every row (never shrinks; header in row 1, as Sohar writes it). That also pulls in
+  // rows an older write left below it. resize needs ExcelApi 1.13; else rows.add, which inserts and pushes what is below down, so
+  // those copies are cleared after. Whatever fails, the rows already written stay on the sheet; the result says if the table has them.
+  async function fitTable(ctx, ws, name, aoa, w){
+    const t = ws.tables.getItemOrNullObject(name); await ctx.sync();
+    if (t.isNullObject) return { table: 'missing' };
+    const bounds = async () => { const r = t.getRange(); r.load('rowIndex,columnIndex,rowCount,columnCount'); await ctx.sync(); return r; };
+    const b = await bounds();
+    if (b.rowIndex !== 0 || b.columnIndex !== 0) return { table: 'short' };
+    if (b.rowCount >= aoa.length && b.columnCount >= w) return { table: 'ok' };
+    try { t.resize(ws.getRangeByIndexes(0, 0, Math.max(b.rowCount, aoa.length), Math.max(b.columnCount, w))); await ctx.sync(); return { table: 'ok' }; }
+    catch (e){ console.warn('Table resize failed; adding rows instead', e); }
+    if (b.rowCount >= aoa.length) return { table: 'short' };   // only columns were missing: rows.add can't add those
+    try {
+      const add = aoa.slice(b.rowCount).map(r => Array.from({ length: b.columnCount }, (_, j) => (r[j] == null ? '' : String(r[j]))));
+      t.rows.add(null, add.map(r => r.map(() => '')));   // blank first: in a General cell '0090001' turns into a number and '=…' into a formula
+      const g = ws.getRangeByIndexes(b.rowCount, 0, add.length, b.columnCount); g.numberFormat = add.map(r => r.map(() => '@')); g.values = add;
+      await ctx.sync();
+    } catch (e){ console.warn('Adding table rows failed', e); return { table: 'short' }; }
+    try {
+      const a = t.getRange(); a.load('rowIndex,columnIndex,rowCount,columnCount'); const u = ws.getUsedRangeOrNullObject(true); u.load('rowIndex,rowCount,columnIndex,columnCount'); await ctx.sync();
+      const end = u.isNullObject ? 0 : u.rowIndex + u.rowCount, top = a.rowIndex + a.rowCount;
+      if (end > top){ ws.getRangeByIndexes(top, 0, end - top, Math.max(a.columnCount, u.columnIndex + u.columnCount)).clear('Contents'); await ctx.sync(); }
+    } catch (e){ console.warn('Clearing below the table failed', e); }   // copies left below the table are harmless (last row per Kind + Key wins)
+    return { table: 'ok' };
   }
   const settings = () => Office.context.document.settings;
   return {
@@ -50,30 +120,56 @@ function OfficeStore(){
       await ctx.sync();
       const dims = x => x.u.isNullObject ? null : { rows: x.u.rowIndex + x.u.rowCount, cols: x.u.columnIndex + x.u.columnCount };
       const out = { names: info.map(x => x.name), grids: {}, cfg: {}, appt: null, hidden: info.filter(x => x.hidden).map(x => x.name) };
-      const apptX = info.find(x => !x.hidden && dims(x) && /^(appointment list|appt list)/i.test(x.name)) || info.find(x => dims(x) && /appointment|appt/i.test(x.name) && dims(x).rows > 50);
-      const cfgKey = n => Object.entries(SHEETS).find(([k, v]) => k !== 'appt' && v.toLowerCase() === n.toLowerCase());
+      // a Clinic Eligibility file (it has SE Info): its own sheets are data, never templates or the appointment list
+      const seFile = info.some(x => x.name.toLowerCase() === SR.SE_SHEETS.info.toLowerCase());
+      const seNames = Object.values(SR.SE_SHEETS).map(n => n.toLowerCase());
+      const isSE = x => seFile && seNames.includes(x.name.toLowerCase());
+      const apptX = info.find(x => !isSE(x) && !x.hidden && dims(x) && /^(appointment list|appt list)/i.test(x.name)) || info.find(x => !isSE(x) && dims(x) && /appointment|appt/i.test(x.name) && dims(x).rows > 50);
+      const cfgKey = n => (Object.entries(SHEETS).find(([k, v]) => k !== 'appt' && v.toLowerCase() === n.toLowerCase()) || [])[0];
       // templates live on small visible sheets; hidden sheets and report tabs are never read
-      const small = info.filter(x => x !== apptX && dims(x) && !x.hidden && !x.name.startsWith(OUT_PREFIX) && !x.name.startsWith(PT_PREFIX) && !cfgKey(x.name) && dims(x).rows <= 800 && dims(x).cols <= 80);
+      const small = info.filter(x => x !== apptX && !isSE(x) && dims(x) && !x.hidden && !x.name.startsWith(OUT_PREFIX) && !x.name.startsWith(PT_PREFIX) && !cfgKey(x.name) && dims(x).rows <= 800 && dims(x).cols <= 80);
       for (let i = 0; i < small.length; i += 6){
         const batch = small.slice(i, i + 6).map(x => { const d = dims(x); const g = x.ws.getRangeByIndexes(0, 0, d.rows, d.cols); g.load('values'); return { x, g }; });
         await ctx.sync(); batch.forEach(b => { out.grids[b.x.name] = b.g.values; });
       }
       for (const x of info){ const k = cfgKey(x.name); const d = dims(x); if (k && d) out.cfg[k] = await readBig(ctx, x.ws, d.rows, Math.min(d.cols, 20)); }
       if (apptX){ const d = dims(apptX); out.appt = { sheet: apptX.name, values: await readBig(ctx, apptX.ws, d.rows, Math.min(d.cols, 60)) }; }
+      // SE sheets are hidden and hold 1-3 KB JSON cells: every column, 500 rows a sync (Excel on the web caps a response at 5 MB)
+      if (seFile){ out.se = {}; for (const x of info){ const d = dims(x); if (isSE(x) && d && x.name.toLowerCase() !== SR.SE_SHEETS.readMe.toLowerCase()) out.se[x.name] = await readBig(ctx, x.ws, d.rows, d.cols, 500); } }
       return out;
     }),
     // replace a sheet's contents (report and config tabs)
+    // fmt.change (Clinic Work; a plain object with its own When, so full screen relays it as is): two people can work one clinic
+    // file, so the change is applied (SoharRules.workRows, by header name) to the rows on the sheet now, read in this same run,
+    // and aoa is not used. Writing the pane's own copy would drop rows the other person saved since this pane read the sheet.
+    // The result then carries rows: the Clinic Work rows written.
     writeSheet: (name, aoa, fmt = {}) => Excel.run(async ctx => {
       const { ws, fresh } = await sheetFor(ctx, name);
       const keep = fmt.keepFormat && !fresh;     // lookup tabs a PM may have colored: replace values only
+      let merged = null;
+      const apply = cur => { merged = SR.workRows(cur, lastWins(cur, fmt.change)); return [SR.CLINIC_WORK_COLS].concat(merged.map(x => SR.CLINIC_WORK_COLS.map(c => x[c]))); };
+      const done = res => (merged ? Object.assign({}, res, { rows: merged }) : res);
+      // inPlace (Clinic Work): write over the old rows first and clear what is left below only after that, so a failed write keeps them
+      if (fmt.inPlace && !fresh){
+        const u = ws.getUsedRangeOrNullObject(true); u.load('rowIndex,rowCount,columnIndex,columnCount'); await ctx.sync();
+        const rows = u.isNullObject ? 0 : u.rowIndex + u.rowCount, cols = u.isNullObject ? 0 : u.columnIndex + u.columnCount;
+        if (fmt.change) aoa = apply(rows ? await readBig(ctx, ws, rows, cols, 500) : []);
+        const w = await writeRows(ctx, ws, aoa, 0, fmt.text);
+        if (rows > aoa.length) ws.getRangeByIndexes(aoa.length, 0, rows - aoa.length, Math.max(cols, w)).clear('Contents');
+        if (cols > w && aoa.length) ws.getRangeByIndexes(0, w, Math.min(rows, aoa.length), cols - w).clear('Contents');
+        await ctx.sync();
+        return done(fmt.table ? await fitTable(ctx, ws, fmt.table, aoa, w).catch(e => { console.warn(e); return { table: 'short' }; }) : undefined);
+      }
+      if (fmt.change) aoa = apply([]);   // a new sheet has no rows yet
       ws.getRange().clear(keep ? 'Contents' : undefined); await ctx.sync();
-      const w = await writeRows(ctx, ws, aoa);
-      if (keep){ await ctx.sync(); return; }
+      const w = await writeRows(ctx, ws, aoa, 0, fmt.text);
+      if (keep){ await ctx.sync(); return done(undefined); }
       const hdr = ws.getRangeByIndexes(0, 0, 1, w); hdr.format.font.bold = true; hdr.format.fill.color = '#DCEFED';
       for (const [c, f] of Object.entries(fmt.numFmt || {})) if (aoa.length > 1) ws.getRangeByIndexes(1, +c, aoa.length - 1, 1).numberFormat = Array.from({ length: aoa.length - 1 }, () => [f]);
       ws.freezePanes.freezeRows(1);
       try { ws.getRangeByIndexes(0, 0, Math.min(aoa.length, 400), w).format.autofitColumns(); } catch {}
       await ctx.sync();
+      return done(fmt.table ? { table: 'missing' } : undefined);   // a sheet made here has no table
     }),
     replaceAppts: (sheetName, aoa, dateCol) => Excel.run(async ctx => {
       const { ws } = await sheetFor(ctx, sheetName || SHEETS.appt); ws.getRange().clear(); await ctx.sync();
@@ -155,7 +251,7 @@ function openFull(){
       try {
         if (!RELAY_OPS.includes(op)) throw new Error('Unknown request');
         let r = await S.store[op](...(args || []));
-        if (op === 'load') r = Object.assign({}, r, { docs: { ctOpts: S.store.getDoc('ctOpts'), ctEsk: S.store.getDoc('ctEsk'), ctEskAt: S.store.getDoc('ctEskAt'), ctFilters: S.store.getDoc('ctFilters') } });
+        if (op === 'load') r = Object.assign({}, r, { docs: { ctOpts: S.store.getDoc('ctOpts'), ctEsk: S.store.getDoc('ctEsk'), ctEskAt: S.store.getDoc('ctEskAt'), ctFilters: S.store.getDoc('ctFilters'), [AUTO_SHOW]: S.store.getDoc(AUTO_SHOW) } });
         reply({ rid, ok: true, res: r ?? null });
       } catch (e){ reply({ rid, ok: false, err: e.message || String(e) }); }
     });
@@ -178,12 +274,22 @@ const SPEC = {
   prov: { name: /^nextgen|^provider$/i, label: /template\s*label|^label$/i, cred: /^cred/i, include: /^include/i },
   hist: { date: /^snapshot/i, prov: /^provider$/i, type: /^slot\s*type$/i, next: /^next/i, third: /^3na/i, open: /^open/i },
 };
+// Clinic Eligibility file: central Sohar's export for one clinic, unpacked with Sohar's own rules.js. Clinic Work = the clinic's edits.
+function seUnpack(raw){
+  if (!raw.se) return { se: null, seErr: null, work: [] };
+  const pick = n => { const k = Object.keys(raw.se).find(x => x.toLowerCase() === n.toLowerCase()); return k ? raw.se[k] : null; };
+  const work = SR.tableObjects(pick(SR.SE_SHEETS.work) || []);
+  try { return { se: SR.clinicUnpack(raw.se), seErr: null, work }; }
+  catch (e){ console.error(e); return { se: null, seErr: e.message || String(e), work }; }
+}
 function prepare(raw){
   const templates = [];
   for (const [name, values] of Object.entries(raw.grids || {})) templates.push(...TE.parseTemplates(name, values));
   const ap = raw.appt ? TE.parseAppts(raw.appt.values) : null;
   if (ap && raw.appt) ap.sheet = raw.appt.sheet;
+  const se = seUnpack(raw);
   return {
+    se: se.se, seErr: se.seErr, work: se.work,
     names: raw.names || [], hidden: raw.hidden || [], grids: raw.grids || {}, templates, ap,
     ref: cfgRows(raw.cfg.ref, SPEC.ref), refExists: !!raw.cfg.ref,
     st: cfgRows(raw.cfg.st, SPEC.st), stExists: !!raw.cfg.st,
@@ -234,6 +340,11 @@ function runCadence(co){
     S.C = { o, v, cad, rc, now, esk, fun: TC.funnel(v.list, R, o), flex: TC.flexUsage(R, v.list, o), rel: TC.releaseList(R, o, now), matches: TC.slotMatches(rc, R, v.list, o, now) };
   } catch (e){ console.error(e); S.Cerr = e.message || String(e); }
 }
+// the clinic's view at this moment (fresh re-verify days, passed visits drop out); Clinic Work overrides ticks and notes
+function runSE(){
+  S.E = null; S.Eerr = null; if (!S.SE) return;
+  try { S.E = SR.clinicDerive(S.SE, S.data.work, new Date()); } catch (e){ console.error(e); S.Eerr = e.message || String(e); }
+}
 async function reload(){
   busy(true, 'Reading the workbook…');
   try {
@@ -242,7 +353,11 @@ async function reload(){
     S.opts = Object.assign(S.opts, S.store.getDoc('ctOpts') || {});
     S.esk = S.store.getDoc('ctEsk') || null;
     S.eskAt = S.store.getDoc('ctEskAt') || null;
-    run(); S.err = null;
+    const first = !S.SE && S.data.se; S.SE = S.data.se;
+    run(); runSE(); S.err = null;
+    if (first) S.view = 'eligibility';
+    // first open of a clinic file: save the setting that opens the pane with the document every time
+    if (S.SE && S.mode === 'pane' && !S.store.getDoc(AUTO_SHOW)) Promise.resolve(S.store.setDoc(AUTO_SHOW, true)).catch(() => {});
   } catch (e){ console.error(e); S.err = e.message || String(e); }
   finally { busy(false); render(); }
 }
@@ -527,12 +642,236 @@ function vTrends(){
     ${lineChart('c7', 'Visits outside template', P(w => w.inBlocked + w.offTemplate), v => num(v))}
   </div><div class="small muted" style="margin-top:6px">Whole weeks only (Sunday to Saturday) inside the From–To range. Hover a chart for the week’s value. Filters above apply.</div></div>`;
 }
+// ---------- Clinic Eligibility (central Sohar's file for one clinic; patients as LASFIR + MRN only) ----------
+const PILL_CHIP = { red: 'bad', amber: 'warn', blue: 'info', grey: 'mute' };
+const PILL_BY_LABEL = new Map(SR.PILLS.map(p => [p.label, p]));
+const pillChip = l => `<span class="chip ${PILL_CHIP[(PILL_BY_LABEL.get(l) || {}).color] || 'mute'}">${esc(l)}</span>`;
+const splitList = (s, sep) => String(s ?? '').split(sep).map(x => x.trim()).filter(Boolean);
+const money = v => { const n = parseFloat(String(v ?? '').replace(/[$,]/g, '')); return isNaN(n) ? null : n; };
+const usd = v => { const n = money(v); return n == null ? '' : '$' + n.toLocaleString('en-US', { maximumFractionDigits: 0 }); };
+const seTag = r => r.LASFIR ? esc(r.LASFIR) : '<span class="muted">(no name)</span>';
+const seId = r => esc(SC.idLabel(r) || 'No MRN');
+const seWhen = s => { const d = new Date(s); return isNaN(d) ? '' : d.toLocaleString('en-US', { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' }); };
+const SEV_WORD = { high: 'Action', medium: 'Check' };
+// Sohar status codes and the Payer Map's "Choose in NextGen" in words front-desk staff can act on
+function plainStatus(s){
+  const t = String(s || '').trim();
+  if (!t || t === 'Not in Sohar file') return 'Not checked yet';
+  if (/^complete\.eligible/i.test(t)) return 'Eligible';
+  if (/^complete\.ineligible/i.test(t)) return 'Not eligible';
+  if (/^pending/i.test(t)) return 'Pending';
+  const e = t.match(/^error\.?([^(\s]*)/i); if (e) return `Error${e[1] ? `: ${e[1].replace(/[._]+/g, ' ')}` : ''}`;
+  if (/^coverage found/i.test(t)) return 'Insurance found';
+  if (/^no coverage/i.test(t)) return 'No insurance found';
+  return t;
+}
+function plainChoose(c){
+  const s = String(c || ''); const m = s.match(/^Not in Payer Map: (.*?)(?: \([^)]*\))?$/);
+  if (m) return `Insurance found: ${esc(m[1])}. Ask billing which NextGen plan to pick.`;
+  return /^One of: /.test(s) ? `Choose one of: ${esc(s.slice(8))}` : `Choose “${esc(s)}”`;
+}
+// deductible / OOP meter: share met, then what is left
+function meterBar(total, remaining, status){
+  if (status === 'None') return '<span class="muted">None</span>';
+  const t = money(total), r = money(remaining);
+  if (t == null || r == null || t <= 0) return status ? esc(status) : '';
+  const f = Math.max(0, Math.min(1, (t - r) / t));
+  return `<span class="meter" role="img" aria-label="${pct(f)} met"><i style="width:${Math.round(f * 100)}%"></i></span> ${status === 'Met' ? '<b style="color:var(--ok)">Met</b>' : `${esc(usd(r))} left`} <span class="muted">of ${esc(usd(t))}</span>`;
+}
+const mcls = s => s === 'Met' ? 'met' : s === 'Approaching' ? 'appr' : '';
+function seTaskMap(){ const T = new Map(); for (const t of S.E.tasks){ const k = String(t['Task Key'] || '').split('|')[0]; if (!T.has(k)) T.set(k, []); T.get(k).push(t); } return T; }
+const seOpen = (r, T) => (T.get(r.key) || []).filter(t => t.clinic && !t.Done);
+// Action / Check lines for a card: flag items (per-visit repeats collapsed, as in Sohar), then the admin's build review
+function seItems(r){
+  const rv = S.E.review.filter(x => x.MRN === r.key && x.Severity !== 'Low');
+  const flags = SR.collapseFlags(rv.filter(x => x.Source === 'Flag').map(x => ({ code: x.Issue, label: x.Pill, severity: String(x.Severity).toLowerCase(), detail: x.Detail, appt: { date: x['Appt Date'], event: x.Event, rendering: x.Rendering } })));
+  return flags.concat(rv.filter(x => x.Source === 'Build').map(x => ({ severity: String(x.Severity).toLowerCase(), detail: x.Detail ? `${x.Issue}: ${x.Detail}` : x.Issue })));
+}
+function seHeadHTML(){
+  const m = S.SE.meta, run = SC.parseDate(m['Run Date']); const age = run ? Math.round((SC.parseDate(new Date()) - run) / 864e5) : 0;
+  return `<div class="filters"><span class="small"><b>Clinic Eligibility</b> · ${esc(m.Location)} · data from ${esc(m['Run Date'])}</span>${age > 7 ? `<span class="chip warn">${num(age)} days old: ask the admin for a new file</span>` : ''}</div>`;
+}
+const seErrCard = () => `<div class="card"><h2>Clinic Eligibility</h2><div class="msg bad">Couldn’t work out the list: ${esc(S.Eerr)}</div></div>`;
+function vEligibility(){
+  if (S.Eerr || !S.E) return seErrCard();
+  const rows = S.E.rows, T = seTaskMap();
+  const count = new Map(); for (const r of rows) for (const l of splitList(r.Pills, ';')) count.set(l, (count.get(l) || 0) + 1);
+  const withTasks = rows.filter(r => seOpen(r, T).length).length;
+  if (S.sePill && !(S.sePill === 'tasks' ? withTasks : count.has(S.sePill))) S.sePill = '';
+  const chip = (v, label, n, cls) => `<button class="chip ${cls}" data-act="sePill" data-v="${esc(v)}" aria-pressed="${S.sePill === v}">${esc(label)} ${num(n)}</button>`;
+  return `<div class="card"><h2>Eligibility <span class="chip mute">${num(rows.length)} patients</span></h2>
+    <div class="small muted">Everyone whose next visit is here, soonest first. Do the tasks before the visit. Your ticks, re-verify requests and notes are saved on the Clinic Work tab, and the admin picks them up from your clinic’s folder.</div>
+    <div class="chips">${chip('', 'All', rows.length, 'mute')}${withTasks ? chip('tasks', 'Has tasks', withTasks, 'warn') : ''}${SR.PILLS.filter(p => count.has(p.label)).map(p => chip(p.label, p.label, count.get(p.label), PILL_CHIP[p.color] || 'mute')).join('')}</div>
+    <input type="search" class="sesearch" data-act="seQ" value="${esc(S.seQ)}" placeholder="Search LASFIR or MRN" aria-label="Search LASFIR or MRN"></div>
+  <div id="seList">${seListHTML(T)}</div>`;
+}
+function seListHTML(T = seTaskMap()){
+  const q = S.seQ.trim().toLowerCase();
+  const rows = S.E.rows.filter(r => (!S.sePill || (S.sePill === 'tasks' ? seOpen(r, T).length : splitList(r.Pills, ';').includes(S.sePill))) && (!q || [r.LASFIR, r.MRN].some(v => String(v || '').toLowerCase().includes(q))));
+  if (!rows.length) return `<div class="card small muted">${S.E.rows.length ? 'No one matches this filter.' : 'No upcoming patients in this file. Ask the admin for a new one.'}</div>`;
+  const days = new Map(); for (const r of rows){ const d = r['Next Appt'] || 'No date'; if (!days.has(d)) days.set(d, []); days.get(d).push(r); }
+  const wd = s => { const d = SC.parseDate(s); return d ? d.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' }) + ' ' : ''; };
+  return `<div class="ptgrid">${[...days].map(([d, rs]) => `<h3 class="day">${esc(wd(d) + d)} <span class="chip mute">${rs.length}</span></h3>${rs.map(r => ptCard(r, T)).join('')}`).join('')}</div>`;
+}
+function ptCard(r, T){
+  const pills = splitList(r.Pills, ';'); const shown = pills.includes('Kaiser/VA MM no auth') ? pills.filter(l => l !== 'Kaiser/VA MM') : pills;   // the filter category only repeats it
+  const high = pills.some(l => (PILL_BY_LABEL.get(l) || {}).severity === 'high');
+  const items = seItems(r), notes = splitList(r.Notes, '|');
+  const tasks = T.get(r.key) || [], mine = tasks.filter(t => t.clinic), adminOpen = tasks.filter(t => !t.clinic && !t.Done).length;
+  const note = S.E.notes.get(r.key);
+  const ver = r['Verified Date'] ? `Verified ${esc(r['Verified Date'])}${r['Days Since Verified'] !== '' ? ` (${esc(days(+r['Days Since Verified']))} ago)` : ''}` : 'Not verified in Sohar yet';
+  const ben = [['Deductible', r.Deductible, r['Deductible Remaining'], r['Deductible Status']], ['OOP max', r['OOP Max'], r['OOP Remaining'], r['OOP Status']]]
+    .map(([l, t, rem, s]) => { const b = meterBar(t, rem, s); return b ? `<div class="mrow ${mcls(s)}"><span class="ml">${l}</span>${b}</div>` : ''; }).join('');
+  const k = esc(r.key);
+  return `<div class="card pt${high ? ' hi' : ''}">
+    <div class="pt-h"><span class="muted">${esc(r['Next Time'])}</span><b>${seTag(r)}</b><span class="small muted">${seId(r)}</span></div>
+    <div class="small">${esc([r['Next Event'], r['Next Provider']].filter(Boolean).join(' · '))}</div>
+    ${shown.length ? `<div class="chips">${shown.map(pillChip).join('')}</div>` : ''}
+    <dl><dt>Payer</dt><dd>${esc(r['Primary Payer'] || 'None on file')}${r['Secondary Payer'] ? ` <span class="muted">+ ${esc(r['Secondary Payer'])}</span>` : ''}</dd>
+      ${r['Choose in NextGen'] ? `<dt>NextGen</dt><dd>${plainChoose(r['Choose in NextGen'])}</dd>` : ''}
+      <dt>Sohar</dt><dd>${esc(plainStatus(r['Sohar Status']))}${r.Plan ? ` · ${esc(r.Plan)}` : ''}<br><span class="small muted">${ver}</span></dd>
+      ${r.Copay !== '' || r.Coinsurance !== '' ? `<dt>Copay</dt><dd>${r.Copay !== '' ? esc(usd(r.Copay) || r.Copay) : '—'}${r.Coinsurance !== '' ? ` · coinsurance ${esc(r.Coinsurance)}` : ''}</dd>` : ''}</dl>
+    ${ben}
+    ${items.length ? `<ul class="items">${items.map(t => `<li class="sev-${esc(t.severity || 'high')}">${SEV_WORD[t.severity] ? `<b>${SEV_WORD[t.severity]}:</b> ` : ''}${esc(t.detail)}</li>`).join('')}</ul>` : ''}
+    ${mine.map(seTaskHTML).join('')}
+    ${adminOpen ? `<div class="small muted">${num(adminOpen)} more task${adminOpen === 1 ? '' : 's'} for the admin.</div>` : ''}
+    ${r['Verification Skipped'] || r['Re-verify Anyway'] ? `<div class="msg info small">${r['Verification Skipped'] ? `${esc(r['Verification Skipped'])}, so this patient isn’t on this week’s verification file (next check ${esc(r['Next Check'] || '?')}).` : 'Verified recently.'}
+      <label class="ck"><input type="checkbox" data-act="seRv" data-m="${k}"${r['Re-verify Anyway'] ? ' checked' : ''}> Re-verify anyway (new card, or another reason to check)</label></div>` : ''}
+    ${note ? `<div class="msg info small"><b>Your note:</b> ${esc(note.Note)} <span class="muted">· ${esc(note.By)}${seWhen(note.When) ? ', ' + esc(seWhen(note.When)) : ''}</span></div>` : ''}
+    ${notes.length ? `<details class="more"><summary>Sohar notes (${notes.length})</summary><ul class="items">${notes.map(t => `<li>${esc(t)}</li>`).join('')}</ul></details>` : ''}
+    <div class="pt-act"><button class="btn sm" data-act="seNote" data-m="${k}">${note ? 'Edit note' : 'Add note'}</button></div>
+  </div>`;
+}
+// a clinic task: the Done tick, and next to it the done note (the Note on the task's Clinic Work "Task done" row). Under it, the
+// task's Clinic Note on the admin's NextGen Tasks when the file was made (sentNote, from SE Done): what the admin already has.
+const seSentHTML = t => (t.sentNote ? `<div class="small tnote"><span class="muted">The admin has this note:</span> ${esc(t.sentNote)}</div>` : '');
+function seTaskHTML(t){
+  const tk = esc(t['Task Key']), m = esc(String(t['Task Key'] || '').split('|')[0]);
+  return `<div class="task"><label class="ck"><input type="checkbox" data-act="seDone" data-k="${tk}" data-m="${m}"${t.Done ? ' checked' : ''}${t.doneBy === 'admin' ? ' disabled' : ''}><span><b>${esc(t.Task)}</b>${t.Details ? ` <span class="small muted">${esc(t.Details)}</span>` : ''}${t.doneBy === 'admin' ? ' <span class="chip ok">Done by the admin</span>' : ''}</span></label>
+    <button class="btn sm" data-act="seTaskNote" data-k="${tk}" data-m="${m}" aria-label="${esc((t.clinicNote ? 'Edit the done note for ' : 'Add a done note for ') + t.Task)}">${t.clinicNote ? 'Edit note' : 'Note'}</button></div>
+    ${seSentHTML(t)}${t.clinicNote ? `<div class="small tnote"><span class="muted">Your note:</span> ${esc(t.clinicNote)}</div>` : ''}`;
+}
+function seTaskNoteDialog(key){
+  const t = S.E.tasks.find(x => x['Task Key'] === key), r = t && seRow(String(key).split('|')[0]); if (!t || !r.key) return;
+  openModal(`<h2>Done note · ${seTag(r)} · ${seId(r)}</h2>
+    <div class="small"><b>${esc(t.Task)}</b>${t.Details ? ` <span class="muted">${esc(t.Details)}</span>` : ''}</div>
+    ${seSentHTML(t)}
+    <div class="fld">What you did<textarea id="seNoteText" maxlength="500" placeholder="${esc('For example: called the patient, new card scanned')}">${esc(t.clinicNote || '')}</textarea></div>
+    <div class="small muted">Saved with this task on the Clinic Work tab, and the admin sees it next to the task. You can save a note before you tick the box. LASFIR and MRN are enough: don’t type the patient’s name or date of birth. ${t.sentNote ? 'A new note takes the place of the admin’s note above once it reaches them. ' : ''}Clearing the box takes the note off this file; a note the admin already has stays.</div>
+    <div class="row" style="margin-top:12px"><button class="btn primary" data-act="seTaskNoteSave" data-k="${esc(key)}">Save note</button><button class="btn" data-act="close">Cancel</button></div>`);
+}
+function vBenefits(){
+  if (S.Eerr || !S.E) return seErrCard();
+  const B = S.E.benefits, sum = SC.benefitsSummary(B), ap = +((S.SE.settings || {}).approachingPct) || 0.2;
+  if (S.seBen && !B.rows.some(b => b.Flag === S.seBen)) S.seBen = '';
+  const rows = B.rows.filter(b => !S.seBen || b.Flag === S.seBen);
+  const k = (l, v, s) => `<div class="kpi"><div class="l">${l}</div><div class="v">${v}</div><div class="s">${s}</div></div>`;
+  const chip = (v, label, n, cls) => `<button class="chip ${cls}" data-act="seBen" data-v="${esc(v)}" aria-pressed="${S.seBen === v}">${esc(label)} ${num(n)}</button>`;
+  const flagChip = f => f ? `<span class="chip ${/met$/.test(f) ? 'ok' : 'warn'}">${esc(f)}</span>` : '';
+  return `<div class="kpis">${k('OOP max met', num(sum.oopMet), 'the plan pays in full')}${k('OOP max approaching', num(sum.oopApproaching), `within ${pct(ap)} of it`)}${k('Deductible met', num(sum.dedMet), 'copay or coinsurance only')}${k('Deductible approaching', num(sum.dedApproaching), `within ${pct(ap)} of it`)}</div>
+  <div class="card"><h2>Benefits <span class="chip mute">${num(sum.verified)} verified</span></h2>
+    <div class="small muted">Latest Sohar verification for each patient, closest to the out-of-pocket max first. Met means the patient has paid the whole amount for the plan year, so the plan pays more of each visit. Use these to set expectations about what the patient owes.</div>
+    <div class="chips">${chip('', 'All', B.rows.length, 'mute')}${[['OOP max met', sum.oopMet, 'ok'], ['OOP max approaching', sum.oopApproaching, 'warn'], ['Deductible met', sum.dedMet, 'ok'], ['Deductible approaching', sum.dedApproaching, 'warn']].filter(x => x[1]).map(x => chip(x[0], x[0], x[1], x[2])).join('')}</div>
+    <div class="tw"><table class="ben"><thead><tr><th>Patient</th><th>Payer</th><th>Benefits</th></tr></thead><tbody>
+    ${rows.map(b => { const m = (l, t, rem, s) => { const x = meterBar(t, rem, s); return x ? `<div class="mrow ${mcls(s)}"><span class="ml">${l}</span>${x}</div>` : ''; };
+      return `<tr><td><b>${seTag(b)}</b> <span class="small muted">${seId(b)}</span><br><span class="small muted">${esc([b['Next Appt'], b['Next Time']].filter(Boolean).join(' '))}</span>${b.Flag ? '<br>' + flagChip(b.Flag) : ''}</td><td>${esc(b['Sohar Payer'])}${b.Plan ? `<br><span class="small muted">${esc(b.Plan)}</span>` : ''}</td>
+        <td><div class="small">Copay ${b.Copay !== '' ? esc(usd(b.Copay) || b.Copay) : '—'}${b.Coinsurance !== '' ? ` · coinsurance ${esc(b.Coinsurance)}` : ''}</div>${m('OOP max', b['OOP Max'], b['OOP Remaining'], b['OOP Status'])}${m('Deductible', b.Deductible, b['Deductible Remaining'], b['Deductible Status'])}</td></tr>`; }).join('') || '<tr><td colspan="3" class="muted">No verified benefits in this file.</td></tr>'}
+    </tbody></table></div>
+    ${sum.pending ? `<div class="small muted" style="margin-top:6px">${num(sum.pending)} more wait on a verification of insurance Sohar found; their benefits come with a later file.</div>` : ''}</div>`;
+}
+// how far the Payer Map's match can be trusted, in words: [chip class, short label, sentence]
+function payerTrust(l){
+  if (!l) return ['mute', 'No history yet', 'Sohar hasn’t seen enough of this payer to say. Check the card at check-in.'];
+  const c = String(l.Confidence || '').toLowerCase(), to = esc(l['Sohar payerName'] || l['Sohar payerId'] || 'a Sohar payer');
+  if (c === 'not in payer map') return ['bad', 'Not mapped', 'Sohar can’t check this payer yet, so these patients get a search for any insurance instead. Check the card and ask billing which NextGen plan to use.'];
+  if (c === 'not a payer') return ['mute', 'Not insurance', 'This NextGen payer isn’t an insurance plan (for example self-pay).'];
+  if (['exact', 'confirmed', 'probable'].includes(c)) return ['ok', 'Reliable', `A person matched it to ${to}.`];
+  if (c === 'learned') return ['ok', 'Reliable', `Sohar agreed with the match to ${to} on ${esc(l['Patients agreed'])} patients.`];
+  if (c === 'auto-high') return ['ok', 'Likely right', `Matched by name to ${to}.`];
+  if (c === 'auto-medium') return ['warn', 'A guess', `Matched by name to ${to}, but nobody has confirmed it.`];
+  return ['warn', 'Not sure', 'The match needs a person to check it.'];
+}
+function vPayers(){
+  if (S.Eerr || !S.E) return seErrCard();
+  const P = S.E.payers;
+  const found = p => { const l = p.learning || {}, m = p.metrics || {}, out = [];
+    if (+l['Patients agreed']) out.push(`Sohar agreed on ${num(+l['Patients agreed'])} patient${+l['Patients agreed'] === 1 ? '' : 's'}`);
+    if (+l['Payer errors']) out.push(`${num(+l['Payer errors'])} came back with a payer error`);
+    if (+l['Discovery other payer']) out.push(`a search found a different payer for ${num(+l['Discovery other payer'])} of ${num(+l['Discovery checked'])}${l['Most common other payer'] ? ` (most often ${esc(l['Most common other payer'])})` : ''}`);
+    if (+m['Failed verification patients']) out.push(`${num(+m['Failed verification patients'])} failed verification${m['Most common failure'] ? ` (most often ${esc(m['Most common failure'])})` : ''}`);
+    return out; };
+  return `<div class="card"><h2>Payers <span class="chip mute">${num(P.length)}</span></h2><div class="small muted">Each insurance your patients carry in NextGen, and how far the match to Sohar can be trusted. When it isn’t reliable, check the card and ask billing. A payer note goes to the admin; it never changes the mapping by itself.</div></div>
+  <div class="ptgrid">${P.map(p => { const [cls, label, why] = payerTrust(p.learning); const f = found(p), m = p.metrics || {}, n = p.note && (p.note.cardSays || p.note.note) ? p.note : null;
+    return `<div class="card pt"><div class="pt-h"><b>${esc(p.payer)}</b><span class="small muted">${num(p.patients)} patient${p.patients === 1 ? '' : 's'}</span></div>
+      <div class="chips"><span class="chip ${cls}">${esc(label)}</span>${m.Recurring === 'Yes' ? `<span class="chip warn">Keeps coming up (${esc(m['Days with issues'])} days)</span>` : ''}</div>
+      <div class="small" style="margin-top:4px">${why}</div>
+      ${f.length ? `<div class="small" style="margin-top:4px"><b>What Sohar found:</b> ${f.join('; ')}.</div>` : ''}
+      ${p.learning && p.learning.Suggestion ? `<div class="small" style="margin-top:4px"><b>Suggestion:</b> ${esc(p.learning.Suggestion)}</div>` : ''}
+      ${cls !== 'ok' ? '<div class="msg warn small">Check the card at check-in, and ask billing if it doesn’t match.</div>' : ''}
+      ${n ? `<div class="msg info small"><b>Your note:</b> ${n.cardSays ? `card says “${esc(n.cardSays)}”` : ''}${n.cardSays && n.note ? '. ' : ''}${esc(n.note)} <span class="muted">· ${esc(n.by)}${seWhen(n.when) ? ', ' + esc(seWhen(n.when)) : ''}</span></div>` : ''}
+      <div class="pt-act"><button class="btn sm" data-act="sePayerNote" data-p="${esc(p.payer)}">${n ? 'Edit payer note' : 'Add payer note'}</button></div></div>`; }).join('') || '<div class="card small muted">No payers in this file.</div>'}</div>`;
+}
+function seNoteDialog(key){
+  const r = S.E.rows.find(x => x.key === key); if (!r) return; const n = S.E.notes.get(key);
+  openModal(`<h2>Note · ${seTag(r)} · ${seId(r)}</h2>
+    <div class="fld">Note for the admin<textarea id="seNoteText" maxlength="1000">${esc(n ? n.Note : '')}</textarea></div>
+    <div class="small muted">Saved on the Clinic Work tab; the admin picks it up from your clinic’s folder. LASFIR and MRN are enough: don’t type the patient’s name or date of birth. Clear the box to remove the note.</div>
+    <div class="row" style="margin-top:12px"><button class="btn primary" data-act="seNoteSave" data-m="${esc(key)}">Save note</button><button class="btn" data-act="close">Cancel</button></div>`);
+}
+function sePayerNoteDialog(name){
+  const p = S.E.payers.find(x => x.payer === name); const n = p && p.note;
+  openModal(`<h2>Payer note · ${esc(name)}</h2>
+    <div class="fld">What the card says (plan name, group, payer phone)<input id="seCard" maxlength="200" value="${esc(n ? n.cardSays : '')}"></div>
+    <div class="fld">Note for the admin<textarea id="seNoteText" maxlength="1000">${esc(n ? n.note : '')}</textarea></div>
+    <div class="small muted">The admin reads this and decides what to change. No member IDs or patient names here. Clear both boxes to remove the note.</div>
+    <div class="row" style="margin-top:12px"><button class="btn primary" data-act="sePayerNoteSave" data-p="${esc(name)}">Save note</button><button class="btn" data-act="close">Cancel</button></div>`);
+}
+// a tick or chip re-draws all of #app: put keyboard focus back on the same control (matched by its data-act/k/m/v/p) so a
+// keyboard or screen-reader user keeps their place in the list
+function renderKeepFocus(){
+  const sel = actSel(document.activeElement);
+  render();
+  const el = sel && $('#app').querySelector(sel); if (el) el.focus();
+}
+// Clinic Work: the whole small sheet is rewritten on each change (last row per Kind + Key wins); writes run one at a time.
+// The list updates at once from this pane's copy; writeSheet applies the same change to the rows on the sheet at write time
+// (someone else may have saved since) and hands them back.
+let workQ = Promise.resolve();
+function seBy(){ let n = ''; try { n = localStorage.getItem('ctWho') || ''; } catch {} return n.trim() || `Clinic ${S.SE.meta.Location}`; }
+function seWrite(change){
+  // When stamped once here, so this copy and the rows written at the sheet match (writeSheet restamps it only when the sheet
+  // already has a later When for the same Kind + Key; the rows then differ and come back below)
+  const ch = Object.assign({ By: seBy(), When: new Date().toISOString() }, change);
+  const rows = SR.workRows(S.data.work, ch);
+  S.data.work = rows; runSE(); renderKeepFocus();
+  const p = workQ.then(() => S.store.writeSheet(SR.SE_SHEETS.work, null, { keepFormat: true, inPlace: true, text: true, table: SE_WORK_TABLE, change: ch })); workQ = p.catch(() => {});
+  return p.then(r => {
+    // the sheet had rows this pane hadn't seen: show them. Skipped while a later change is on its way (its write hands back newer rows).
+    if (r && Array.isArray(r.rows) && S.data.work === rows && JSON.stringify(r.rows) !== JSON.stringify(rows)){ S.data.work = r.rows; runSE(); renderKeepFocus(); }
+    // saved, but outside the table the admin's flow reads: say so once a session
+    if (r && r.table && r.table !== 'ok' && !S.seTableWarned){ S.seTableWarned = true; toast('warn', `Saved on the Clinic Work tab. The admin’s inbox reads only the rows inside the Clinic Work table, and ${r.table === 'missing' ? 'this file doesn’t have one' : 'it couldn’t be made bigger'}, so send the saved file to the admin in OneDrive or Teams.`, 12000); }
+  }, e => { console.error(e); toast('bad', `Couldn’t save that on the Clinic Work tab: ${esc(e.message || String(e))}. Try again after the refresh.`, 9000); return reload(); });
+}
+const seRow = key => S.E.rows.find(x => x.key === key) || {};
+function seSetupCard(){
+  const d = S.data, se = S.SE;
+  if (!se) return d.seErr ? `<div class="card"><h2>Clinic Eligibility file</h2><div class="msg bad">${esc(d.seErr)}</div></div>` : '';
+  let who = ''; try { who = localStorage.getItem('ctWho') || ''; } catch {}
+  return `<div class="card"><h2>Clinic Eligibility file</h2>
+    <div class="small">${esc(se.meta.Location)} · data from ${esc(se.meta['Run Date'])}${S.E ? ` · ${num(S.E.counts.patients)} patients · ${num(S.E.counts.clinicTasks)} open tasks for you` : ''} · ${num(d.work.length)} change${d.work.length === 1 ? '' : 's'} on Clinic Work</div>
+    <div class="fld">Your name or initials (goes in By on Clinic Work)<input data-act="seWho" maxlength="60" value="${esc(who)}" placeholder="${esc('Clinic ' + se.meta.Location)}"></div>
+    <div class="small muted">Central Sohar made this file for your clinic. It holds PHI (MRNs, insurance, visits): keep it in your clinic’s folder in the Clinic Eligibility library (MHS OneDrive or Teams only). Excel on the web saves your changes on its own and the admin picks them up from there, so you don’t need to send the file back. If the file isn’t in the library, or the admin asks for it, save it and send it to the admin through OneDrive or Teams. Don’t edit the hidden tabs.</div>
+    <label class="ck" style="margin-top:8px"><input type="checkbox" data-act="seTemplates"${S.opts.templates === 'On' ? ' checked' : ''}> Show template tools <span class="small muted">(templates, cadence, recall and access; they need a NextGen appointment list)</span></label>
+    <div class="small muted" style="margin-top:6px">Clinic Template Tool ${esc(APP_VERSION)} · Sohar file ${esc(se.meta['Sohar Version'])}</div></div>`;
+}
 function vSetup(){
+  if (S.SE && S.opts.templates !== 'On') return seSetupCard();
   const d = S.data, ap = d.ap, R = S.R;
   const has = ap && !ap.error ? ap.has : {};
   const flag = (ok, t) => `<span class="chip ${ok ? 'ok' : 'warn'}">${ok ? '✓' : '—'} ${t}</span>`;
   const linkRows = d.templates.map(t => { const tt = R && R.templates.find(x => x.sheet === t.sheet && x.anchor[0] === t.anchor[0] && x.anchor[1] === t.anchor[1]); return { t, prov: tt && tt.provider }; });
-  return `<div class="card"><h2>Appointment list</h2>
+  const hidden = S.SE ? d.hidden.filter(n => !/^se /i.test(n) && n !== SHEETS.pcr) : d.hidden;   // a clinic file’s own data tabs are read
+  return seSetupCard() + `<div class="card"><h2>Appointment list</h2>
     ${!ap ? `<div class="msg warn">No Appointment List tab yet. Import the NextGen appointment report below.</div>` : ap.error ? `<div class="msg bad">${esc(ap.error)} (tab “${esc(ap.sheet)}”)</div>` :
     `<div class="small">Tab <b>${esc(ap.sheet)}</b>: ${num(ap.rows.length)} visits, ${TE.mdy(ap.min)} – ${TE.mdy(ap.max)}${ap.runAt != null ? `, report run ${TE.mdy(ap.runAt)} ${TE.hhmm(Math.round((ap.runAt % 1) * 1440))}` : ''}.</div>
      <div class="row" style="margin:6px 0">${flag(true, 'Date, time, provider, event, status')}${flag(has.dur, 'Duration / end time')}${flag(has.loc, 'Location')}${flag(has.cancel, 'Cancel date/time')}${flag(has.booked, 'Created date')}${flag(has.pt || has.mrn, 'Patient (Pat Name, Md Rc)')}${flag(has.payer, 'Payer Name')}</div>
@@ -541,7 +880,7 @@ function vSetup(){
   <div class="card"><h2>Provider templates<span class="sp"></span><button class="btn sm primary" data-act="newTemplate">New template tab</button></h2>
     <div class="small muted">Every visible tab is scanned for a weekly grid: a Monday–Friday header row, times down the left, slot types in the cells, and Provider:/Location:/Effective From: labels above. The New template tab button makes one in the standard layout; you can also paste a copy of an existing template.</div>
     <table style="margin-top:6px"><thead><tr><th>Tab</th><th>Label</th><th>Linked to</th><th>Slots</th><th>Hours</th></tr></thead><tbody>${linkRows.map(({ t, prov }) => `<tr><td>${esc(t.sheet)}</td><td>${esc(t.label || '(no label)')}</td><td>${prov ? esc(prov) : '<span class="chip bad">Not linked</span> <span class="small muted">set it on the Providers tab</span>'}</td><td>${t.slots.length} × ${t.step} min</td><td>${TE.hhmm(t.start)}–${TE.hhmm(t.end)}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">None found.</td></tr>'}</tbody></table>
-    ${d.hidden.length ? `<div class="small muted" style="margin-top:6px">Hidden tabs aren’t read: ${d.hidden.map(esc).join(', ')}.</div>` : ''}</div>
+    ${hidden.length ? `<div class="small muted" style="margin-top:6px">Hidden tabs aren’t read: ${hidden.map(esc).join(', ')}.</div>` : ''}</div>
   <div class="card"><h2>Lookup tabs</h2>
     <table><tbody>
       <tr><td><b>${SHEETS.st}</b></td><td class="small">Slot type → Clinical or Blocked, and which visits it accepts (event class, service line or event; comma = any of, + = all of, * = anything).</td><td>${d.stExists ? flag(true, `${d.st.length} rows`) : flag(false, 'Using built-in defaults')}</td><td><button class="btn sm" data-act="cfgSt">${d.stExists ? 'Add missing types' : 'Create'}</button></td></tr>
@@ -564,17 +903,42 @@ function vSetup(){
     <div class="row" style="margin-top:6px"><label class="btn">Import access model…<input type="file" accept=".xlsx" data-act="importEsk" hidden></label>${S.esk ? `<span class="small muted">Loaded: ${esc(S.esk.modality)} · ${esc(S.esk.clinic)} · ${esc(String(S.esk.generated).slice(0, 10))}</span>` : ''}</div></div></div>`;
 }
 
+// ---------- navigation ----------
+// A Clinic Eligibility file shows only the Sohar views unless Setup → Show template tools is on. Other workbooks: as before.
+function shownViews(st = S){
+  const tools = !st.SE || (st.opts && st.opts.templates) === 'On';
+  return VIEWS.map(v => v[0]).filter(k => SE_VIEWS.includes(k) ? !!st.SE : k === 'setup' || tools);
+}
+const viewOff = (k, st = S) => !SE_VIEWS.includes(k) && k !== 'setup' && !st.R;   // template views need the appointment list
+function navGroups(st = S){
+  const vis = shownViews(st);
+  return NAV.map(([k, l, vs]) => ({ k, l, views: vs.filter(v => vis.includes(v)) })).filter(g => g.views.length);
+}
+// the view to draw: the chosen one if it is shown and has its data, else Eligibility (clinic file) or Setup
+function currentView(st = S){
+  const ready = !!st.R || !!st.SE; const v = ready ? st.view : 'setup';
+  return shownViews(st).includes(v) && !viewOff(v, st) ? v : st.SE ? 'eligibility' : 'setup';
+}
+function navHTML(view){
+  const groups = navGroups(); const cur = groups.find(g => g.views.includes(view));
+  const go = g => { const on = g.views.filter(v => !viewOff(v)); return g === cur ? view : on.includes(S.sub[g.k]) ? S.sub[g.k] : on[0] || g.views[0]; };
+  const top = `<nav class="tabs">${groups.map(g => `<button data-view="${go(g)}"${g === cur ? ' aria-current="page"' : ''}${g.views.every(v => viewOff(v)) ? ' disabled' : ''}>${esc(g.views.length === 1 ? VIEW_LABEL[g.views[0]] : g.l)}</button>`).join('')}</nav>`;
+  const sub = cur && cur.views.length > 1 ? `<nav class="tabs sub" aria-label="${esc(cur.l)}">${cur.views.map(k => `<button data-view="${k}"${k === view ? ' aria-current="page"' : ''}${viewOff(k) ? ' disabled' : ''}>${esc(VIEW_LABEL[k])}</button>`).join('')}</nav>` : '';
+  if (cur) S.sub[cur.k] = view;
+  return top + sub;
+}
+
 function render(){
   for (const k in CHARTS) delete CHARTS[k];
   if (S.err) { $('#app').innerHTML = `<main><div class="card"><h2>Can’t read the workbook</h2><div class="msg bad">${esc(S.err)}</div><button class="btn primary" data-act="refresh">Try again</button></div></main>`; return; }
   if (!S.data) return;
-  const ready = !!S.R; const view = ready ? S.view : 'setup';
-  const body = { overview: vOverview, templates: vTemplates, access: vAccess, cadence: vCadence, funnel: vFunnel, recall: vRecall, visits: vVisits, impact: vImpact, trends: vTrends, setup: vSetup }[view]();
-  $('#app').innerHTML = `<header class="top"><div class="bar"><div class="brand"><span class="dot">CT</span><span>Clinic Template Tool</span><small>${S.R ? `${S.R.tByProv.size} templates · ${num(S.data.ap.rows.length)} visits` : ''}</small></div>
+  const view = currentView(); const se = SE_VIEWS.includes(view);
+  const body = { overview: vOverview, templates: vTemplates, access: vAccess, cadence: vCadence, funnel: vFunnel, recall: vRecall, visits: vVisits, impact: vImpact, trends: vTrends, eligibility: vEligibility, benefits: vBenefits, payers: vPayers, setup: vSetup }[view]();
+  $('#app').innerHTML = `<header class="top"><div class="bar"><div class="brand"><span class="dot" title="Clinic Template Tool ${esc(APP_VERSION)}">CT</span><span>Clinic Template Tool</span><small>${S.R && !se ? `${S.R.tByProv.size} templates · ${num(S.data.ap.rows.length)} visits` : ''}</small></div>
     <button class="iconbtn" data-act="refresh" title="Re-read the workbook" aria-label="Refresh">⟳</button>
     ${S.mode === 'pane' && S.canFull ? `<button class="iconbtn" data-act="full" title="Full screen" aria-label="Full screen">⛶</button>` : ''}${S.mode === 'dialog' ? `<button class="iconbtn" data-act="closeFull" title="Close full screen" aria-label="Close full screen">✕</button>` : ''}</div>
-    <nav class="tabs">${VIEWS.map(([k, l]) => `<button data-view="${k}"${k === view ? ' aria-current="page"' : ''}${!ready && k !== 'setup' ? ' disabled' : ''}>${l}</button>`).join('')}</nav>
-    ${ready && view !== 'setup' ? filtersHTML() : ''}</header><main>${!ready && view === 'setup' && S.data.ap && !S.data.ap.error ? '' : ''}${body}</main>`;
+    ${navHTML(view)}
+    ${se ? seHeadHTML() : S.R && view !== 'setup' ? filtersHTML() : ''}</header><main>${body}</main>`;
 }
 
 // ---------- actions ----------
@@ -598,8 +962,19 @@ document.addEventListener('click', async e => {
     else if (act === 'dlManifest') downloadManifest();
     else if (act === 'copyOutreach') await copyOutreach();
     else if (act === 'writePatients') await writePatientTabs();
+    else if (act === 'sePill'){ S.sePill = S.sePill === a.dataset.v ? '' : a.dataset.v; renderKeepFocus(); }
+    else if (act === 'seBen'){ S.seBen = S.seBen === a.dataset.v ? '' : a.dataset.v; renderKeepFocus(); }
+    else if (act === 'seNote') seNoteDialog(a.dataset.m);
+    else if (act === 'sePayerNote') sePayerNoteDialog(a.dataset.p);
+    else if (act === 'seNoteSave'){ const r = seRow(a.dataset.m), note = $('#seNoteText').value.trim(); closeModal(); await seWrite({ Kind: 'Note', Key: a.dataset.m, MRN: r.MRN, LASFIR: r.LASFIR, Note: note }); }
+    else if (act === 'seTaskNote') seTaskNoteDialog(a.dataset.k);
+    // no Value: workRows keeps the tick as it is (a note-only row leaves Done alone)
+    else if (act === 'seTaskNoteSave'){ const k = a.dataset.k, r = seRow(k.split('|')[0]), note = $('#seNoteText').value.trim(); closeModal(); await seWrite({ Kind: 'Task done', Key: k, MRN: r.MRN, LASFIR: r.LASFIR, Note: note }); }
+    else if (act === 'sePayerNoteSave'){ const card = $('#seCard').value.trim(), note = $('#seNoteText').value.trim(); closeModal(); await seWrite({ Kind: 'Payer note', Key: a.dataset.p, Value: card, Note: note }); }
   } catch (err){ console.error(err); busy(false); toast('bad', esc(err.message || String(err)), 9000); }
 });
+// search re-draws the list only, so the box keeps focus while typing
+document.addEventListener('input', e => { const t = e.target; if (t.dataset && t.dataset.act === 'seQ' && S.E){ S.seQ = t.value; const box = $('#seList'); if (box) box.innerHTML = seListHTML(); } });
 document.addEventListener('change', async e => {
   const t = e.target;
   if (t.dataset.f){ S.f[t.dataset.f] = t.value; run(); render(); return; }
@@ -615,11 +990,15 @@ document.addEventListener('change', async e => {
     else if (act === 'importAppts' && t.files[0]) await importAppts(t.files[0]);
     else if (act === 'importEsk' && t.files[0]) await importEsk(t.files[0]);
     else if (act === 'tplCopy') fillTemplateDefaults();
+    else if (act === 'seDone'){ const r = seRow(t.dataset.m); await seWrite({ Kind: 'Task done', Key: t.dataset.k, MRN: r.MRN, LASFIR: r.LASFIR, Value: t.checked ? 'Yes' : 'No' }); }
+    else if (act === 'seRv'){ const r = seRow(t.dataset.m); await seWrite({ Kind: 'Re-verify anyway', Key: t.dataset.m, MRN: r.MRN, LASFIR: r.LASFIR, Value: t.checked ? 'On' : 'Off' }); }
+    else if (act === 'seTemplates'){ S.opts.templates = t.checked ? 'On' : ''; await S.store.setDoc('ctOpts', S.opts); render(); }
+    else if (act === 'seWho'){ try { localStorage.setItem('ctWho', t.value.trim()); } catch {} }
   } catch (err){ console.error(err); busy(false); toast('bad', esc(err.message || String(err)), 9000); }
 });
 
 let xlsxP = null;
-function loadXLSX(){ return xlsxP || (xlsxP = new Promise(res => { if (window.XLSX) return res(true); const s = document.createElement('script'); s.src = 'assets/xlsx.full.min.js'; s.onload = () => res(!!window.XLSX); s.onerror = () => { xlsxP = null; res(false); }; document.head.appendChild(s); })); }
+function loadXLSX(){ return xlsxP || (xlsxP = new Promise(res => { if (window.XLSX) return res(true); const s = document.createElement('script'); s.src = 'assets/xlsx.full.min.js?v=' + APP_VERSION; s.onload = () => res(!!window.XLSX); s.onerror = () => { xlsxP = null; res(false); }; document.head.appendChild(s); })); }
 async function readFileAoa(file){
   if (!(await loadXLSX())) throw new Error('Couldn’t load the spreadsheet reader. Check the connection and try again.');
   const wb = XLSX.read(await file.arrayBuffer(), { type: 'array', cellDates: false, raw: false });

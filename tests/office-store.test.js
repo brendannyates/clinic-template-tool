@@ -29,6 +29,7 @@ function loadApp(Excel){
   const sandbox = { console, setTimeout, clearTimeout, Excel, Office: undefined, window: {}, location: { href: 'https://x/taskpane.html', search: '' },
     document: { querySelector: el, querySelectorAll: () => [], addEventListener(){}, createElement: el, head: el() } };
   sandbox.TE = require('../engine.js'); sandbox.TC = require('../cadence.js'); sandbox.PayerRules = require('../payer-rules.js'); sandbox.self = sandbox;
+  sandbox.SoharCore = require('../core.js'); sandbox.SoharRules = require('../rules.js');   // Clinic Eligibility files (shared with Sohar)
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8') + '\n;this.__api = { OfficeStore, S };', sandbox);
   return sandbox.__api;
