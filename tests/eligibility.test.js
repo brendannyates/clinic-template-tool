@@ -43,7 +43,7 @@ const FILES = () => [
   { name: 'verification output.csv', rows: [VER_HDR, ...[
     { requestId: 'v-501', id: '900001', url: 'https://app.soharhealth.com/verifications/v-501', created: iso(-1), resolved: iso(-1) + 'T17:00:00Z', memberId: 'C501', payerName: 'Cigna', status: 'complete.eligible',
       firstName: 'Testa', lastName: 'Quillfeather', planName: 'SYNTH OPEN ACCESS', innCopay: '30', innTotalDeductible: '1000', innRemainingDeductible: '100', innOutOfPocket: '4000', innOutOfPocketRemaining: '2500' },
-    { requestId: 'v-502', id: '900002', created: iso(-1), resolved: iso(-1) + 'T18:00:00Z', memberId: 'BS502', payerName: 'Blue Shield of California', status: 'error.member.id' },
+    { requestId: 'v-502', id: '900002', created: iso(-1), resolved: iso(-1) + 'T18:00:00Z', memberId: 'BS502', payerName: 'Blue Shield of California', status: 'complete.ineligible' },
     { requestId: 'v-504', id: '900004', created: iso(-1), resolved: iso(-1) + 'T18:00:00Z', memberId: 'C504', payerName: 'Cigna', status: 'complete.eligible', innCopay: '20' },
   ].map(o => pick(VER_HDR, o))] },
   { name: 'discovery output.csv', rows: [DISC_HDR, ...[
@@ -57,8 +57,8 @@ function adminSrc(){
   const built = C.buildPatients(IMPORT(), CFG);
   const merged = C.mergeSoharResults(IMPORT(), FILES(), CFG);
   const patients = C.applyReverifySkips(built.patients, merged.results, { ...C.REVERIFY_DEFAULTS, today: NOW }).patients.filter(p => p['In Scope'] === 'Yes');
-  const fresh = C.buildTasks(merged.results);
-  const fix = fresh.find(t => t.MRN === '900002' && t.Task === 'Fix member ID in NextGen');
+  const fresh = C.buildTasks(merged.results, { flags: R.allFlags(patients, merged.results, { today: NOW, sfhpProviders: [], reverifyDays: 7, reverifyNewMonth: false, payerRules: RULES, locationState: LOCSTATE }), patients });
+  const fix = fresh.find(t => t.MRN === '900002' && t.Task === 'Policy newly ineligible');
   return { fixKey: fix['Task Key'], src: {
     patients, results: merged.results, review: built.review, tasks: C.keepDone(fresh, [{ 'Task Key': fix['Task Key'], Done: 'x' }]),
     learningRows: [blankRow(C.PAYER_LEARNING_COLS, { 'NextGen Payer': 'Cigna', Confidence: 'Exact', 'Sohar payerName': 'Cigna', 'Patients agreed': '4' }), blankRow(C.PAYER_LEARNING_COLS, { 'NextGen Payer': 'Blue Shield CA', Confidence: 'Auto-Medium', 'Payer errors': '2' })],
@@ -130,8 +130,8 @@ test('pack -> workbook -> load() -> prepare -> derive gives the clinic list; no 
   assert.deepEqual(S.E.rows.map(strip), admin.map(strip), 'same rows as the admin, minus names and DOB');
   assert.deepEqual(S.E.flags, new Map([...flags].filter(([k]) => S.E.rows.some(r => r.key === k))));
   const t = (mrn, task) => S.E.tasks.find(x => x.MRN === mrn && x.Task === task);
-  assert.equal(t('900002', 'Fix member ID in NextGen').doneBy, 'admin');
-  assert.equal(t('900001', 'Update benefits in NextGen').clinic, true);
+  assert.equal(t('900002', 'Policy newly ineligible').doneBy, 'admin');
+  assert.equal(t('900002', 'Policy newly ineligible').clinic, true);
   assert.deepEqual(S.E.benefits.rows.map(b => [b.MRN, b.LASFIR, b['OOP Status']]).filter(b => b[0] === '900001'), [['900001', 'QUITES', 'Not met']]);
   assert.equal(S.view, 'eligibility', 'a clinic file opens on Eligibility');
   assert.equal(docs['Office.AutoShowTaskpaneWithDocument'], true, 'first open saves the auto-show setting');
@@ -195,7 +195,7 @@ test('Clinic Work: each change upserts by Kind + Key and rewrites the whole shee
   assert.ok(r1()['Verification Skipped'], 'verified yesterday: skipped this week');
   await api.seWrite({ Kind: 'Re-verify anyway', Key: '900001', MRN: '900001', LASFIR: 'QUITES', Value: 'On' });
   assert.equal(r1()['Re-verify Anyway'], 'Yes', 'the list re-derives at once');
-  const ben = S.E.tasks.find(t => t.MRN === '900001' && t.Task === 'Update benefits in NextGen')['Task Key'];
+  const ben = S.E.tasks.find(t => t.MRN === '900001' && t.Task === 'Credential for payer')['Task Key'];
   // two quick changes: queued, and the last write holds both
   const p1 = api.seWrite({ Kind: 'Re-verify anyway', Key: '900001', MRN: '900001', LASFIR: 'QUITES', Value: 'Off' });
   const p2 = api.seWrite({ Kind: 'Task done', Key: ben, MRN: '900001', LASFIR: 'QUITES', Value: 'Yes' });
@@ -492,7 +492,7 @@ test('two people in one clinic file: each change goes onto the rows on the sheet
   const pack = R.clinicPack(LOC, src);
   const sh = tableSheet([R.CLINIC_WORK_COLS], { rows: 2 });   // as Sohar exports it
   const A = await paneOn(sh, pack), B = await paneOn(sh, pack);
-  const ben = A.S.E.tasks.find(t => t.MRN === '900001' && t.Task === 'Update benefits in NextGen')['Task Key'];
+  const ben = A.S.E.tasks.find(t => t.MRN === '900001' && t.Task === 'Credential for payer')['Task Key'];
   const rv = (by, v) => wr('Re-verify anyway', '900001', { Value: v, By: by });
   // Ana first: nothing new on the sheet, so her list is left as it was drawn
   const pa = A.seWrite(rv('Ana', 'On')); const mineA = A.S.data.work; await pa;
@@ -581,20 +581,20 @@ test('a Clinic Work change reads the sheet by header name, and a failed write st
 
 test('done notes back from the admin: each task shows the note the admin has, in plain words, and the clinic can still add its own', async () => {
   const { src, fixKey } = adminSrc();
-  const ben = src.tasks.find(t => t.MRN === '900001' && t.Task === 'Update benefits in NextGen')['Task Key'];
+  const ben = src.tasks.find(t => t.MRN === '900003' && t.Task === 'Add insurance in NextGen')['Task Key'];
   // a bring-back wrote one Clinic Note (it quotes the patient's name); the admin typed the other
-  const notes = { [ben]: 'called Testa Quillfeather, new card scanned (Front desk, San Rafael, 10/21)', [fixKey]: 'billing has the new card' };
+  const notes = { [ben]: 'called Juniper Kiddington, new card scanned (Front desk, San Rafael, 10/21)', [fixKey]: 'billing has the new card' };
   const tasks = src.tasks.map(t => (notes[t['Task Key']] ? Object.assign({}, t, { 'Clinic Note': notes[t['Task Key']] }) : t));
   const pack = R.clinicPack(LOC, Object.assign({}, src, { tasks }));
   const { api, els, writes, fire } = await appWith(bookOf(pack));
   const S = api.S, task = k => S.E.tasks.find(t => t['Task Key'] === k);
-  const sent = 'called QUITES, new card scanned (Front desk, San Rafael, 10/21)';
+  const sent = 'called KIDJUN, new card scanned (Front desk, San Rafael, 10/21)';
   assert.deepEqual([task(ben).sentNote, task(ben).clinicNote, task(ben).Done], [sent, '', ''], 'a note alone doesn’t tick the task');
   S.view = 'eligibility'; api.render(); let html = els['#app'].innerHTML;
   assert.ok(html.includes(`The admin has this note:</span> ${sent}`));
   assert.ok(html.includes('The admin has this note:</span> billing has the new card'), 'on a task the admin did too');
   for (const s of NEVER) assert.ok(!html.includes(s), `"${s}" is not on the list`);
-  assert.ok(html.includes(`data-k="${ben}" data-m="900001" aria-label="Add a done note for Update benefits in NextGen">Note</button>`), 'the clinic can still add a note');
+  assert.ok(html.includes(`data-k="${ben}" data-m="900003" aria-label="Add a done note for Add insurance in NextGen">Note</button>`), 'the clinic can still add a note');
   // the dialog shows the admin's note and starts empty
   await fire('click', { target: { closest: s => (s === '[data-act]' ? { tagName: 'BUTTON', dataset: { act: 'seTaskNote', k: ben } } : null) } });
   const dlg = els['#sheet'].innerHTML;
@@ -621,8 +621,8 @@ test('done notes: a Note button by each clinic task; a note keeps the tick, a ti
   const { src } = adminSrc();
   const { api, els, writes, fire } = await appWith(bookOf(R.clinicPack(LOC, src)));
   const S = api.S;
-  const task = mrn => S.E.tasks.find(t => t.MRN === mrn && t.Task === 'Update benefits in NextGen');
-  const key = task('900001')['Task Key'];
+  const task = mrn => S.E.tasks.find(t => t.MRN === mrn && t.Task === 'Add insurance in NextGen');
+  const key = task('900003')['Task Key'];
   S.view = 'eligibility'; api.render();
   let html = els['#app'].innerHTML;
   const count = s => html.split(s).length - 1;
@@ -631,15 +631,15 @@ test('done notes: a Note button by each clinic task; a note keeps the tick, a ti
   // open the dialog: LASFIR + MRN only
   await fire('click', { target: { closest: s => (s === '[data-act]' ? { tagName: 'BUTTON', dataset: { act: 'seTaskNote', k: key } } : null) } });
   const dlg = els['#sheet'].innerHTML;
-  assert.ok(dlg.includes('Done note · QUITES') && dlg.includes('MRN 900001') && dlg.includes('data-act="seTaskNoteSave"'));
+  assert.ok(dlg.includes('Done note · KIDJUN') && dlg.includes('MRN 900003') && dlg.includes('data-act="seTaskNoteSave"'));
   for (const s of NEVER) assert.ok(!dlg.includes(s), `"${s}" is not in the dialog`);
   const save = async note => { els['#seNoteText'] = { value: note }; await fire('click', { target: { closest: s => (s === '[data-act]' ? { tagName: 'BUTTON', dataset: { act: 'seTaskNoteSave', k: key } } : null) } }); };
-  const tick = async on => fire('change', { target: { dataset: { act: 'seDone', k: key, m: '900001' }, checked: on } });
+  const tick = async on => fire('change', { target: { dataset: { act: 'seDone', k: key, m: '900003' }, checked: on } });
   const lastRow = () => R.tableObjects(writes[writes.length - 1][1]).find(r => r.Kind === 'Task done' && r.Key === key);
   // a note with the box unticked: a note-only row, Done stays as the file has it
   await save('  Called the patient, new card scanned ');
   assert.deepEqual([lastRow().Value, lastRow().Note], ['', 'Called the patient, new card scanned']);
-  assert.deepEqual([task('900001').Done, task('900001').clinicNote], ['', 'Called the patient, new card scanned']);
+  assert.deepEqual([task('900003').Done, task('900003').clinicNote], ['', 'Called the patient, new card scanned']);
   html = els['#app'].innerHTML;
   assert.ok(html.includes('Your note:</span> Called the patient, new card scanned') && html.includes('>Edit note<'));
   const m0 = R.mergeClinicWork(writes[writes.length - 1][1], { location: LOC, requests: [], tasks: src.tasks, sentDone: S.SE.done, notes: [], payerNotes: [] });
@@ -649,7 +649,7 @@ test('done notes: a Note button by each clinic task; a note keeps the tick, a ti
   await tick(true);
   assert.deepEqual([lastRow().Value, lastRow().Note], ['Yes', 'Called the patient, new card scanned']);
   await save('Called the patient twice');
-  assert.deepEqual([lastRow().Value, lastRow().Note, task('900001').Done], ['Yes', 'Called the patient twice', 'Yes']);
+  assert.deepEqual([lastRow().Value, lastRow().Note, task('900003').Done], ['Yes', 'Called the patient twice', 'Yes']);
   const m1 = R.mergeClinicWork(writes[writes.length - 1][1], { location: LOC, requests: [], tasks: src.tasks, sentDone: S.SE.done, notes: [], payerNotes: [] });
   assert.deepEqual([m1.done.get(key), m1.doneNotes.get(key).split(' (')[0]], [`Yes (clinic ${LOC})`, 'Called the patient twice']);
   // the same rows through the central inbox (what the flow appends) apply the same way
@@ -658,7 +658,7 @@ test('done notes: a Note button by each clinic task; a note keeps the tick, a ti
   const m2 = R.mergeClinicWork(byLoc.get(LOC), { location: LOC, requests: [], tasks: src.tasks, sentDone: S.SE.done, notes: [], payerNotes: [], now: NOW });
   assert.deepEqual([m2.done.get(key), m2.doneNotes.get(key)], [m1.done.get(key), m1.doneNotes.get(key)]);
   await save('');
-  assert.deepEqual([lastRow().Value, lastRow().Note, task('900001').clinicNote], ['Yes', '', '']);
+  assert.deepEqual([lastRow().Value, lastRow().Note, task('900003').clinicNote], ['Yes', '', '']);
   assert.ok(!els['#app'].innerHTML.includes('Your note:</span>'));
   const m3 = R.mergeClinicWork(writes[writes.length - 1][1], { location: LOC, requests: [], tasks: src.tasks, sentDone: S.SE.done, notes: [], payerNotes: [] });
   assert.equal(m3.doneNotes.has(key), false, 'a cleared note never erases the admin’s');
@@ -673,7 +673,7 @@ test('a dialog takes keyboard focus, keeps Tab inside, and gives focus back to t
   const { src } = adminSrc();
   const { api, els, doc, fire } = await appWith(bookOf(R.clinicPack(LOC, src)));
   const S = api.S;
-  const key = S.E.tasks.find(t => t.MRN === '900001' && t.Task === 'Update benefits in NextGen')['Task Key'];
+  const key = S.E.tasks.find(t => t.MRN === '900001' && t.Task === 'Credential for payer')['Task Key'];
   S.view = 'eligibility'; api.render();
   // a fake focusable: focus() makes it the active element and logs it
   const log = [];
