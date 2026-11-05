@@ -1,7 +1,7 @@
 // Clinic Template Tool: Excel add-in front end. Analysis lives in engine.js (TE).
 // Clinic Eligibility files use Sohar's own core.js / rules.js (SoharCore / SoharRules, byte-identical copies).
 'use strict';
-const APP_VERSION = '1.1.1';   // bump with every ?v= in taskpane.html
+const APP_VERSION = '1.1.2';   // bump with every ?v= in taskpane.html
 const SC = SoharCore, SR = SoharRules;
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
