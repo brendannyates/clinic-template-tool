@@ -1062,6 +1062,17 @@ function navHTML(view){
   return top + sub;
 }
 
+// top right, flush: refresh, full screen (or exit), then the Dev Update bell, which docks in .du-slot (dev-updates.js).
+// data-tip is the hover label: what a press does. This tool has no light/dark toggle (it follows Windows).
+const ICON = {
+  refresh: '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v5h-5"/></svg>',
+  full: '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>',
+};
+function toolsHTML(){
+  const full = S.mode === 'dialog' ? `<button class="iconbtn" data-act="closeFull" data-tip="Exit full screen" aria-label="Exit full screen">${ICON.full}</button>`
+    : S.canFull ? `<button class="iconbtn" data-act="full" data-tip="Full screen" aria-label="Full screen">${ICON.full}</button>` : '';
+  return `<div class="tools"><button class="iconbtn" data-act="refresh" data-tip="Refresh" aria-label="Refresh">${ICON.refresh}</button>${full}<span class="du-slot"></span></div>`;
+}
 function render(){
   for (const k in CHARTS) delete CHARTS[k];
   if (S.err) { $('#app').innerHTML = `<main><div class="card"><h2>Can’t read the workbook</h2><div class="msg bad">${esc(S.err)}</div><button class="btn primary" data-act="refresh">Try again</button></div></main>`; return; }
@@ -1071,8 +1082,7 @@ function render(){
   const body = { overview: vOverview, templates: vTemplates, access: vAccess, cadence: vCadence, funnel: vFunnel, recall: vRecall, visits: vVisits, impact: vImpact, trends: vTrends, eligibility: vEligibility, benefits: vBenefits, payers: vPayers, setup: vSetup }[view]();
   $('#app').innerHTML = `<header class="top"><div class="bar"><div class="brand"><span class="dot" title="Clinic Template Tool ${esc(APP_VERSION)}">CT</span><span>Clinic Template Tool</span><small>${S.R && !se ? `${S.R.tByProv.size} templates · ${num(S.data.ap.rows.length)} visits` : ''}</small></div>
     ${S.name ? `<button class="whoami" data-act="switchUser" title="Switch user"><b>${esc(S.name)}</b><small>Switch user</small></button>` : ''}
-    <button class="iconbtn" data-act="refresh" title="Re-read the workbook" aria-label="Refresh">⟳</button>
-    ${S.mode === 'pane' && S.canFull ? `<button class="iconbtn" data-act="full" title="Full screen" aria-label="Full screen">⛶</button>` : ''}${S.mode === 'dialog' ? `<button class="iconbtn" data-act="closeFull" title="Close full screen" aria-label="Close full screen">✕</button>` : ''}</div>
+    ${toolsHTML()}</div>
     ${navHTML(view)}
     ${se ? seHeadHTML() : S.R && view !== 'setup' ? filtersHTML() : ''}</header><main>${body}</main>`;
 }

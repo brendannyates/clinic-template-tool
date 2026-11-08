@@ -6,7 +6,7 @@
       "bullets": [
         "New: When the tool opens, it asks for your name. Pick yours, or add it if you're new. Your name shows at the top; press it to switch user.",
         "New: On a Clinic Eligibility file, the ticks and notes you save on Clinic Work carry the name you picked.",
-        "New: This bell shows what changed in the tool. Drag it anywhere and it stays there on this computer. If a button ends up under it, it steps aside."
+        "New: This bell, next to refresh and full screen, shows what changed in the tool. Hover over any of them to see what it does."
       ]
     }
   ]
