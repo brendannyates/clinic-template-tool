@@ -55,7 +55,9 @@ Workbooks without an `SE Info` tab work exactly as before.
 
 ## Development
 
-No build step. `engine.js` holds the template analysis and `cadence.js` the cadence, recall and funnel logic (pure functions), `app.js` the UI and Excel calls, `taskpane.html` the page. `core.js`, `rules.js` and `payer-rules.js` are byte-identical copies of the Sohar Eligibility add-in's files (see CLAUDE.md).
+No build step. `engine.js` holds the template analysis and `cadence.js` the cadence, recall and funnel logic (pure functions), `app.js` the UI and Excel calls, `taskpane.html` the page. `core.js`, `rules.js` and `payer-rules.js` are byte-identical copies of the Sohar Eligibility add-in's files (see CLAUDE.md). `dev-updates.js` / `.css` are the Dev Update bell shared with the other MHS add-ins; add a notice to the top of `dev-updates.json` with each release staff should hear about.
+
+On open the tool shows a loading screen while it reads the workbook, then "Enter your name" if nobody has picked for today on this computer. The names are kept in the workbook's document settings (`ctUsers`, no sheet); today's pick is kept per workbook in this computer's localStorage (`ctWho:<workbook key>`). The picked name is the By on Clinic Work.
 
 ```
 npm test
