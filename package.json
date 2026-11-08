@@ -1,8 +1,8 @@
 {
   "name": "clinic-template-tool",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "private": true,
   "scripts": {
-    "test": "node --test tests/engine.test.js tests/office-store.test.js tests/cadence.test.js tests/payer-rules.test.js tests/eligibility.test.js"
+    "test": "node --test tests/engine.test.js tests/office-store.test.js tests/cadence.test.js tests/payer-rules.test.js tests/eligibility.test.js tests/who.test.js"
   }
 }

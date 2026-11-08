@@ -6,6 +6,7 @@
 <meta http-equiv="Content-Security-Policy" content="connect-src 'self'">
 <title>Clinic Template Tool</title>
 <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<link rel="stylesheet" href="dev-updates.css?v=1.1.3">
 <style>
 :root{
   --bg:#f4f5f2;--surface:#fdfdfb;--surface2:#ecefe9;--ink:#22262a;--muted:#62686e;--line:#dde1da;
@@ -109,6 +110,44 @@ label.ck{display:flex;gap:6px;align-items:flex-start;font-size:13px;margin:4px 0
 .tnote{margin:0 0 6px 20px;overflow-wrap:anywhere}
 .pt-act{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
 details.more summary{cursor:pointer;font-size:12.5px;color:var(--muted)}
+/* toolbar, flush right: refresh, full screen, then the Dev Update bell docked in .du-slot (dev-updates.css, shared) */
+.tools{display:flex;align-items:center;gap:8px;flex:none}
+.tools .iconbtn{position:relative;color:var(--ink)}
+/* toolbar hover labels: what the press does */
+.tools .iconbtn[data-tip]:hover::after,.tools .iconbtn[data-tip]:focus-visible::after{content:attr(data-tip);position:absolute;top:calc(100% + 6px);right:0;white-space:nowrap;padding:5px 9px;border-radius:8px;background:var(--ink);color:var(--surface);font-size:12px;font-weight:500;line-height:1.2;pointer-events:none;z-index:60}
+.devupd{--font:"Segoe UI",system-ui,-apple-system,sans-serif;--surface-2:var(--line);--surface-3:var(--surface2)}
+.du-bell{border:1px solid var(--line)}
+/* docked: the same size and frame as refresh and full screen */
+.devupd.du-docked .du-bell{width:34px;height:34px;border-radius:10px;background:var(--surface);color:var(--ink)}
+.devupd.du-docked .du-bell:hover{background:var(--surface);border-color:var(--accent)}
+.devupd.du-docked .du-dot{top:6px;right:7px}
+.devupd.du-docked .du-card,.devupd.du-docked .du-panel{top:42px}
+/* who's using the tool, beside refresh */
+.whoami{border:1px solid var(--line);background:var(--surface);border-radius:10px;height:34px;padding:0 10px;cursor:pointer;display:flex;flex-direction:column;justify-content:center;align-items:flex-start;line-height:1.15;max-width:120px;min-width:0;flex:none}
+.whoami:hover{border-color:var(--accent)}
+.whoami b{font-size:12.5px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.whoami small{font-size:11px;color:var(--muted)}
+/* the loading screen on open, then "Enter your name" (the IVK Tracker's layout); a long list scrolls */
+.boot{min-height:100vh;display:flex;overflow:auto;padding:24px}
+.bootin{width:min(380px,100%);margin:auto;display:flex;flex-direction:column;align-items:center;text-align:center}
+.bootin h1{margin:22px 0 0;font-size:26px;line-height:1.2}.bootin>p{margin:6px 0 0;font-size:14px}
+.spinner{width:44px;height:44px;border-radius:50%;border:4px solid var(--surface2);border-top-color:var(--accent);animation:ctspin .9s linear infinite}
+@keyframes ctspin{to{transform:rotate(360deg)}}
+.steps{list-style:none;width:100%;margin:24px 0 0;padding:0;text-align:left}
+.step{display:grid;grid-template-columns:22px 1fr;gap:12px;align-items:start;padding:8px 0;border-top:1px solid var(--line)}
+.step .k{width:20px;height:20px;border-radius:50%;border:2px solid var(--line);margin-top:1px;display:grid;place-items:center;font-size:11px;font-weight:700;color:var(--accent-ink)}
+.step.done .k{background:var(--accent);border-color:var(--accent)}
+.step.now .k{border-color:var(--ink)}
+.step .t{font-size:14px}.step.next .t{color:var(--muted)}
+.step .m{display:block;font-size:12.5px;color:var(--muted);margin-top:1px;min-height:17px}
+.boot.who .bootin{width:min(420px,100%)}
+.whohero{display:flex;flex-direction:column;align-items:center}.whohero h1{margin:0}
+.wholist{display:flex;flex-direction:column;gap:8px;width:100%;margin-top:22px}
+.wholist .whob{display:flex;justify-content:space-between;align-items:center;gap:8px;width:100%;min-height:48px;font-size:16px;text-align:left}
+.whob .tag{font-size:12px;font-weight:500;padding:3px 10px;border-radius:12px;background:var(--surface2);color:var(--muted);white-space:nowrap}
+.whonew{width:100%;margin-top:14px;text-align:left}
+.whonew>summary{cursor:pointer;min-height:44px;display:flex;align-items:center;font-weight:600;color:var(--accent)}
+@media (prefers-reduced-motion:reduce){.spinner{animation-duration:2.4s}}
 @media(max-width:520px){.kpi .v{font-size:19px} th,td{padding:4px 6px}}
 @media(max-width:700px){header.top{position:static}}   /* the filter row would cover a narrow task pane */
 </style>
@@ -119,11 +158,12 @@ details.more summary{cursor:pointer;font-size:12.5px;color:var(--muted)}
 <div id="busy" hidden><div id="busyMsg">Working…</div></div>
 <div id="toast"></div>
 <div id="tip" class="tip" hidden></div>
-<script src="engine.js?v=1.1.2"></script>
-<script src="cadence.js?v=1.1.2"></script>
-<script src="payer-rules.js?v=1.1.2"></script>
-<script src="core.js?v=1.1.2"></script>
-<script src="rules.js?v=1.1.2"></script>
-<script src="app.js?v=1.1.2"></script>
+<script src="engine.js?v=1.1.3"></script>
+<script src="cadence.js?v=1.1.3"></script>
+<script src="payer-rules.js?v=1.1.3"></script>
+<script src="core.js?v=1.1.3"></script>
+<script src="rules.js?v=1.1.3"></script>
+<script src="dev-updates.js?v=1.1.3"></script>
+<script src="app.js?v=1.1.3"></script>
 </body>
 </html>

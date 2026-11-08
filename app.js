@@ -1,7 +1,7 @@
 // Clinic Template Tool: Excel add-in front end. Analysis lives in engine.js (TE).
 // Clinic Eligibility files use Sohar's own core.js / rules.js (SoharCore / SoharRules, byte-identical copies).
 'use strict';
-const APP_VERSION = '1.1.2';   // bump with every ?v= in taskpane.html
+const APP_VERSION = '1.1.3';   // bump with every ?v= in taskpane.html
 const SC = SoharCore, SR = SoharRules;
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -19,7 +19,63 @@ const SE_VIEWS = ['eligibility', 'benefits', 'payers'];   // need a Clinic Eligi
 const SE_WORK_TABLE = 'tblClinicWork';   // the Clinic Work table Sohar's clinicPack makes; the admin's Power Automate flow reads it
 const AUTO_SHOW = 'Office.AutoShowTaskpaneWithDocument';
 const S = { view: 'overview', data: null, R: null, f: { from: '', to: '', loc: '', prov: '', sl: '' }, opts: { lateHours: 24, target: 14, asOf: '', releaseHours: 24, convDays: 90, lapsedDays: 60, overdueMult: 1.5, tmsCount: 30, maintDays: 180, matchDays: 10, dayStart: '08:00', dayEnd: '18:00' }, heatMetric: 'fill', trendType: '', impactWhy: '', recallState: 'call', store: null, mode: 'pane', full: false,
-  SE: null, E: null, sub: {}, sePill: '', seQ: '', seBen: '' };
+  SE: null, E: null, sub: {}, sePill: '', seQ: '', seBen: '', users: [], name: '', picking: false, askWho: false, boot: null };
+
+// ---------- who's using the tool ----------
+// People add their name to the workbook (document setting ctUsers: [{ name, added }]); no sheet is added. This computer keeps, per
+// workbook, who picked today and who has used it here before (localStorage "ctWho:<workbook key>"). The first open each day asks
+// "Enter your name" from that list, with nobody picked. The pane decides; full screen gets the pane's pick with each load.
+// askWho is set only when running inside Excel (and the headless harness), so Node tests that draw views see them straight away.
+const USERS_KEY = 'ctUsers', WBID_KEY = 'ctWbId';
+const userKey = n => String(n == null ? '' : n).trim().toLowerCase();
+const cleanName = s => String(s == null ? '' : s).replace(/\s+/g, ' ').slice(0, 30).trim();
+function userList(v){
+  const seen = new Set(), out = [];
+  for (const x of Array.isArray(v) ? v : []){
+    const name = cleanName(x && typeof x === 'object' ? x.name : x), k = userKey(name); if (!name || seen.has(k)) continue;
+    seen.add(k); out.push({ name, added: String((x && x.added) || '') });
+  }
+  return out;
+}
+const withUser = (list, name, at) => { const L = userList(list), n = cleanName(name); return !n || L.some(u => userKey(u.name) === userKey(n)) ? L : L.concat([{ name: n, added: at || new Date().toISOString().slice(0, 10) }]); };
+// the people who have used this computer on this workbook first (most recent first), then everyone else A-Z
+function pickOrder(users, here){
+  const H = (here || []).map(userKey), rank = u => { const i = H.indexOf(userKey(u.name)); return i < 0 ? Infinity : i; };
+  return (users || []).map(u => Object.assign({}, u, { here: rank(u) !== Infinity })).sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+}
+function wbKeyOf(s){
+  let h = 0x811c9dc5; const t = String(s || '').trim().toLowerCase().replace(/[?#].*$/, '');
+  for (let i = 0; i < t.length; i++){ h ^= t.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return t ? 'w' + h.toString(36) : '';
+}
+// what this computer remembers for one workbook: { day: '2026-11-07', name: 'Sam', used: ['Sam', 'Ana'] }. The pick lasts the day.
+function whoRec(json){ try { const o = JSON.parse(json || '{}') || {}; return { day: String(o.day || ''), name: String(o.name || ''), used: Array.isArray(o.used) ? o.used.map(String).filter(Boolean) : [] }; } catch { return { day: '', name: '', used: [] }; } }
+const whoToday = (rec, day) => rec && rec.day === day ? rec.name : '';
+const whoPick = (rec, name, day) => ({ day, name, used: [name].concat(((rec && rec.used) || []).filter(n => userKey(n) !== userKey(name))).slice(0, 20) });
+const dayIso = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+const LS = { get(k){ try { return localStorage.getItem(k) || ''; } catch { return ''; } }, set(k, v){ try { localStorage.setItem(k, v); } catch { /* this session only */ } } };
+function workbookKey(){
+  let url = ''; try { url = Office.context.document.url || ''; } catch { /* no document */ }
+  if (url) return wbKeyOf(url);
+  let id = S.store && S.store.getDoc(WBID_KEY);
+  if (!id && S.store){ id = `id${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`; Promise.resolve(S.store.setDoc(WBID_KEY, id)).catch(() => {}); }
+  return wbKeyOf(id);
+}
+const whoKey = () => { if (!S.wb) S.wb = workbookKey(); return S.wb ? `ctWho:${S.wb}` : ''; };
+const whoRead = () => whoRec(whoKey() ? LS.get(whoKey()) : '');
+// today's pick on this computer, if they're still on the workbook's list
+function loadWho(){
+  if (S.mode === 'dialog') return;
+  const n = whoToday(whoRead(), dayIso()), u = n && S.users.find(x => userKey(x.name) === userKey(n));
+  S.name = u ? u.name : '';
+}
+function setWho(name){
+  S.name = name || ''; S.picking = false;
+  if (S.mode === 'dialog'){ if (S.store && S.store.send) S.store.send({ ev: 'who', name: S.name }); return; }
+  if (whoKey() && name) LS.set(whoKey(), JSON.stringify(whoPick(whoRead(), name, dayIso())));
+  if (toChild) toChild({ ev: 'who', name: S.name });
+}
+const mustPick = () => S.askWho && (!S.name || S.picking);
 
 // ---------- small UI helpers ----------
 function toast(kind, html, ms = 5000){ const d = document.createElement('div'); d.className = 'msg ' + kind; d.innerHTML = html; $('#toast').appendChild(d); setTimeout(() => d.remove(), ms); }
@@ -114,10 +170,13 @@ function OfficeStore(){
   const settings = () => Office.context.document.settings;
   return {
     live: true,
-    load: () => Excel.run(async ctx => {
+    // step(i, info), when given, ticks the loading screen as each read finishes (0 tabs, 1 template grids, 2 lookups, 3 visits)
+    load: step => Excel.run(async ctx => {
+      const tick = (i, o) => { if (step) try { step(i, o); } catch (e){ console.error(e); } };
       const wss = ctx.workbook.worksheets; wss.load('items/name,items/visibility'); await ctx.sync();
       const info = wss.items.map(ws => { const u = ws.getUsedRangeOrNullObject(true); u.load('rowCount,columnCount,rowIndex,columnIndex'); return { ws, name: ws.name, hidden: ws.visibility !== 'Visible', u }; });
       await ctx.sync();
+      tick(0, { tabs: info.length });
       const dims = x => x.u.isNullObject ? null : { rows: x.u.rowIndex + x.u.rowCount, cols: x.u.columnIndex + x.u.columnCount };
       const out = { names: info.map(x => x.name), grids: {}, cfg: {}, appt: null, hidden: info.filter(x => x.hidden).map(x => x.name) };
       // a Clinic Eligibility file (it has SE Info): its own sheets are data, never templates or the appointment list
@@ -132,10 +191,13 @@ function OfficeStore(){
         const batch = small.slice(i, i + 6).map(x => { const d = dims(x); const g = x.ws.getRangeByIndexes(0, 0, d.rows, d.cols); g.load('values'); return { x, g }; });
         await ctx.sync(); batch.forEach(b => { out.grids[b.x.name] = b.g.values; });
       }
+      tick(1, { scanned: small.length });
       for (const x of info){ const k = cfgKey(x.name); const d = dims(x); if (k && d) out.cfg[k] = await readBig(ctx, x.ws, d.rows, Math.min(d.cols, 20)); }
+      tick(2, { lookups: Object.keys(out.cfg).map(k => SHEETS[k]) });
       if (apptX){ const d = dims(apptX); out.appt = { sheet: apptX.name, values: await readBig(ctx, apptX.ws, d.rows, Math.min(d.cols, 60)) }; }
       // SE sheets are hidden and hold 1-3 KB JSON cells: every column, 500 rows a sync (Excel on the web caps a response at 5 MB)
       if (seFile){ out.se = {}; for (const x of info){ const d = dims(x); if (isSE(x) && d && x.name.toLowerCase() !== SR.SE_SHEETS.readMe.toLowerCase()) out.se[x.name] = await readBig(ctx, x.ws, d.rows, d.cols, 500); } }
+      tick(3, { appt: out.appt ? { sheet: out.appt.sheet, rows: Math.max(0, out.appt.values.length - 1) } : null, se: seFile });
       return out;
     }),
     // replace a sheet's contents (report and config tabs)
@@ -215,6 +277,17 @@ function OfficeStore(){
     }),
     getDoc: k => { try { return settings().get(k); } catch { return null; } },
     setDoc: (k, v) => new Promise(res => { try { settings().set(k, v); settings().saveAsync(() => res()); } catch { res(); } }),
+    // add a name to the workbook's list: re-read the saved settings first so a name someone else added since this pane opened
+    // isn't lost, then save. Returns the list. A read-only workbook keeps it for this session only.
+    addUser: name => new Promise(res => {
+      let done = false;
+      const add = () => {
+        if (done) return; done = true;
+        let next = []; try { next = withUser(settings().get(USERS_KEY), name); settings().set(USERS_KEY, next); settings().saveAsync(() => res(next)); } catch { res(next); }
+      };
+      try { settings().refreshAsync(() => add()); } catch { add(); }
+      setTimeout(add, 5000);   // refreshAsync that never answers
+    }),
   };
 }
 
@@ -222,10 +295,15 @@ function OfficeStore(){
 const CH = 12000;
 function sendChunks(fn, obj){ const s = JSON.stringify(obj); const id = Math.random().toString(36).slice(2); const n = Math.max(1, Math.ceil(s.length / CH)); for (let i = 0; i < n; i++) fn(JSON.stringify({ c: id, i, n, d: s.slice(i * CH, (i + 1) * CH) })); }
 function makeRx(handler){ const buf = {}; return str => { let m; try { m = JSON.parse(str); } catch { return; } if (!m || !m.c) return; const b = buf[m.c] || (buf[m.c] = []); b[m.i] = m.d; if (b.filter(x => x != null).length === m.n){ delete buf[m.c]; try { handler(JSON.parse(b.join(''))); } catch (e){ console.error(e); } } }; }
-const RELAY_OPS = ['load', 'writeSheet', 'replaceAppts', 'createTemplate', 'copyTemplate', 'setDoc'];
+const RELAY_OPS = ['load', 'writeSheet', 'replaceAppts', 'createTemplate', 'copyTemplate', 'setDoc', 'addUser'];
+// the full-screen side: Dev Update ids seen in the pane, and the pane's pick when someone switches user there
 function RemoteStore(){
   const pend = new Map(); let docs = {};
-  const rx = makeRx(m => { if (m.rid && pend.has(m.rid)){ const p = pend.get(m.rid); pend.delete(m.rid); m.ok ? p.res(m.res) : p.rej(new Error(m.err)); } });
+  const rx = makeRx(m => {
+    if (window.DevUpdates && DevUpdates.receive(m)) return;
+    if (m.ev === 'who'){ S.name = m.name || ''; S.picking = false; render(); return; }
+    if (m.rid && pend.has(m.rid)){ const p = pend.get(m.rid); pend.delete(m.rid); m.ok ? p.res(m.res) : p.rej(new Error(m.err)); }
+  });
   Office.context.ui.addHandlerAsync(Office.EventType.DialogParentMessageReceived, a => rx(a.message));
   const up = obj => sendChunks(s => Office.context.ui.messageParent(s), obj);
   const call = (op, args) => new Promise((res, rej) => { const rid = Math.random().toString(36).slice(2); pend.set(rid, { res, rej }); up({ rid, op, args }); setTimeout(() => { if (pend.has(rid)){ pend.delete(rid); rej(new Error('Excel didn’t answer. Keep the add-in panel open behind full screen, then try again.')); } }, 120000); });
@@ -234,29 +312,38 @@ function RemoteStore(){
     async load(){ const d = await call('load'); docs = d.docs || {}; return d; },
     writeSheet: (...a) => call('writeSheet', a), replaceAppts: (...a) => call('replaceAppts', a), createTemplate: (...a) => call('createTemplate', a), copyTemplate: (...a) => call('copyTemplate', a),
     getDoc: k => docs[k] ?? null, async setDoc(k, v){ docs[k] = v; await call('setDoc', [k, v]); },
+    async addUser(n){ const r = await call('addUser', [n]); docs[USERS_KEY] = r; return r; },
+    send(obj){ up(obj); },
     close(){ up({ ev: 'close' }); },
   };
 }
-let DLG = null;
+let DLG = null, toChild = null;
+const closedFull = () => { DLG = null; toChild = null; S.full = false; if (window.DevUpdates) DevUpdates.setSend(null); reload(); };
 function openFull(){
   if (DLG || S.mode !== 'pane') return;
-  const url = location.href.replace(/[?#].*$/, '') + '?mode=dialog';
+  const base = location.href.replace(/[?#].*$/, '') + '?mode=dialog';
+  // the Dev Updates already dismissed here go along, so full screen doesn't show them again
+  const url = window.DevUpdates ? DevUpdates.dialogUrl(base) : base;
   Office.context.ui.displayDialogAsync(url, { height: 96, width: 96, displayInIframe: true }, res => {
     if (res.status !== Office.AsyncResultStatus.Succeeded){ toast('bad', 'Couldn’t open full screen: ' + esc(res.error && res.error.message)); return; }
     DLG = res.value; S.full = true; render();
     const reply = obj => { try { sendChunks(s => DLG && DLG.messageChild(s), obj); } catch (e){ console.error(e); } };
+    toChild = reply; if (window.DevUpdates) DevUpdates.setSend(reply);
     const rx = makeRx(async m => {
-      if (m.ev === 'close'){ try { DLG.close(); } catch {} DLG = null; S.full = false; reload(); return; }
+      if (window.DevUpdates && DevUpdates.receive(m)) return;   // a Dev Update dismissed in full screen
+      if (m.ev === 'close'){ try { DLG.close(); } catch {} closedFull(); return; }
+      if (m.ev === 'who'){ setWho(m.name); render(); return; }   // switched user in full screen
       const { rid, op, args } = m;
       try {
         if (!RELAY_OPS.includes(op)) throw new Error('Unknown request');
         let r = await S.store[op](...(args || []));
-        if (op === 'load') r = Object.assign({}, r, { docs: { ctOpts: S.store.getDoc('ctOpts'), ctEsk: S.store.getDoc('ctEsk'), ctEskAt: S.store.getDoc('ctEskAt'), ctFilters: S.store.getDoc('ctFilters'), [AUTO_SHOW]: S.store.getDoc(AUTO_SHOW) } });
+        if (op === 'load') r = Object.assign({}, r, { who: S.name, docs: { ctOpts: S.store.getDoc('ctOpts'), ctEsk: S.store.getDoc('ctEsk'), ctEskAt: S.store.getDoc('ctEskAt'), ctFilters: S.store.getDoc('ctFilters'), [AUTO_SHOW]: S.store.getDoc(AUTO_SHOW), [USERS_KEY]: S.store.getDoc(USERS_KEY), [WBID_KEY]: S.store.getDoc(WBID_KEY) } });
+        if (op === 'addUser') S.users = userList(r);
         reply({ rid, ok: true, res: r ?? null });
       } catch (e){ reply({ rid, ok: false, err: e.message || String(e) }); }
     });
     DLG.addEventHandler(Office.EventType.DialogMessageReceived, a => rx(a.message));
-    DLG.addEventHandler(Office.EventType.DialogEventReceived, () => { DLG = null; S.full = false; reload(); });
+    DLG.addEventHandler(Office.EventType.DialogEventReceived, () => closedFull());
   });
 }
 
@@ -345,16 +432,63 @@ function runSE(){
   S.E = null; S.Eerr = null; if (!S.SE) return;
   try { S.E = SR.clinicDerive(S.SE, S.data.work, new Date()); } catch (e){ console.error(e); S.Eerr = e.message || String(e); }
 }
+// the loading screen on first open: each step ticks as its read finishes (OfficeStore.load), then the templates are measured
+const BOOT = ['Connecting to the workbook', 'Looking for template grids', 'Reading Slot Types, Ref and Providers', 'Reading the appointment list', 'Measuring the templates'];
+const plural = (n, w) => `${num(n)} ${w}${n === 1 ? '' : 's'}`;
+function bootStep(i, o){
+  const B = S.boot || (S.boot = { i: 0, m: [] });
+  B.m[i] = i === 0 ? plural(o.tabs, 'tab') : i === 1 ? `${plural(o.scanned, 'tab')} scanned` : i === 2 ? (o.lookups.length ? o.lookups.join(', ') : 'None yet, using built-in slot types')
+    : o.appt ? `${plural(o.appt.rows, 'row')} on ${o.appt.sheet}` : o.se ? 'Clinic Eligibility file' : 'No Appointment List tab yet';
+  B.i = i + 1; render();
+}
+function bootDone(){
+  const B = S.boot || (S.boot = { i: 0, m: [] });
+  B.m[4] = S.R ? `${plural(S.R.tByProv.size, 'template')} · ${plural(S.data.ap.rows.length, 'visit')}` : S.SE ? 'Clinic eligibility ready' : 'Nothing to measure yet'; B.i = 5;
+}
+function bootHTML(){
+  const B = S.boot || { i: 0, m: [] }, steps = S.mode === 'dialog' ? ['Getting the workbook from the task pane'] : BOOT;
+  return `<div class="boot" role="status" aria-live="polite"><div class="bootin"><div class="spinner" aria-hidden="true"></div><h1>Clinic Template Tool</h1><p class="muted">Reading the workbook.</p>
+    <ol class="steps">${steps.map((t, i) => `<li class="step ${B.i > i ? 'done' : B.i === i ? 'now' : 'next'}"><span class="k">${B.i > i ? '✓' : ''}</span><span><span class="t">${t}</span><span class="m">${esc(B.m[i] || '')}</span></span></li>`).join('')}</ol></div></div>`;
+}
+// "Enter your name": this workbook's list only, the people who've used this computer here first, nobody picked
+function pickHTML(){
+  const L = pickOrder(S.users, S.mode === 'dialog' ? [] : whoRead().used), cancel = S.picking && S.name;
+  return `<div class="boot who"><div class="bootin"><div class="whohero"><h1>Enter your name</h1>
+    <p class="muted">${L.length ? 'Pick yours below, or add it if you’re new.' : 'Nobody has added their name to this workbook yet. Add yours to start.'}</p></div>
+    ${L.length ? `<div class="wholist" role="group" aria-label="People on this workbook">${L.map(u => `<button class="btn whob" data-act="pickUser" data-v="${esc(u.name)}">${esc(u.name)}${u.here ? '<span class="tag">On this computer</span>' : ''}</button>`).join('')}</div>` : ''}
+    <details class="whonew"${L.length ? '' : ' open'}><summary>${L.length ? 'I’m not on the list' : 'Add your name'}</summary>
+      <label class="fld">Your name<input id="whoNew" autocomplete="off" spellcheck="false" maxlength="30"><span class="small muted">Usually your first name. Add a last initial if someone here shares it.</span></label>
+      <div class="row"><button class="btn primary" data-act="addUser">Add me and start</button></div></details>
+    ${cancel ? `<div class="row" style="margin-top:12px"><button class="btn sm" data-act="pickCancel">Stay as ${esc(S.name)}</button></div>` : ''}</div></div>`;
+}
+async function addUser(){
+  const n = cleanName($('#whoNew') && $('#whoNew').value); if (!n){ toast('warn', 'Type your name first.'); return; }
+  const had = S.users.find(u => userKey(u.name) === userKey(n));
+  if (!had){
+    busy(true, 'Adding you…');
+    try {
+      if (S.store.addUser) S.users = userList(await S.store.addUser(n));
+      else { const next = withUser(S.users, n); await S.store.setDoc(USERS_KEY, next); S.users = next; }
+    } finally { busy(false); }
+  }
+  pickUser(had ? had.name : n);
+}
+function pickUser(n){ if (!n) return; setWho(n); render(); toast('ok', `Hi ${esc(n)}.`, 2500); }
+
 async function reload(){
-  busy(true, 'Reading the workbook…');
+  const opening = !S.data;   // first read: the loading screen, not the busy overlay
+  if (opening){ S.err = null; S.boot = { i: 0, m: [] }; render(); } else busy(true, 'Reading the workbook…');
   try {
-    const raw = await S.store.load();
+    const raw = await S.store.load(opening && S.mode === 'pane' ? bootStep : undefined);
     S.data = prepare(raw);
+    S.users = userList(S.store.getDoc(USERS_KEY));
+    if (S.mode === 'dialog'){ if (raw.who != null) S.name = raw.who; } else loadWho();
     S.opts = Object.assign(S.opts, S.store.getDoc('ctOpts') || {});
     S.esk = S.store.getDoc('ctEsk') || null;
     S.eskAt = S.store.getDoc('ctEskAt') || null;
     const first = !S.SE && S.data.se; S.SE = S.data.se;
     run(); runSE(); S.err = null;
+    if (opening) bootDone();
     if (first) S.view = 'eligibility';
     // first open of a clinic file: save the setting that opens the pane with the document every time
     if (S.SE && S.mode === 'pane' && !S.store.getDoc(AUTO_SHOW)) Promise.resolve(S.store.setDoc(AUTO_SHOW, true)).catch(() => {});
@@ -837,7 +971,8 @@ function renderKeepFocus(){
 // The list updates at once from this pane's copy; writeSheet applies the same change to the rows on the sheet at write time
 // (someone else may have saved since) and hands them back.
 let workQ = Promise.resolve();
-function seBy(){ let n = ''; try { n = localStorage.getItem('ctWho') || ''; } catch {} return n.trim() || `Clinic ${S.SE.meta.Location}`; }
+// By on Clinic Work: the name picked at "Enter your name" (older versions kept a typed name in ctWho on this computer)
+function seBy(){ return S.name || LS.get('ctWho').trim() || `Clinic ${S.SE.meta.Location}`; }
 function seWrite(change){
   // When stamped once here, so this copy and the rows written at the sheet match (writeSheet restamps it only when the sheet
   // already has a later When for the same Kind + Key; the rows then differ and come back below)
@@ -856,10 +991,9 @@ const seRow = key => S.E.rows.find(x => x.key === key) || {};
 function seSetupCard(){
   const d = S.data, se = S.SE;
   if (!se) return d.seErr ? `<div class="card"><h2>Clinic Eligibility file</h2><div class="msg bad">${esc(d.seErr)}</div></div>` : '';
-  let who = ''; try { who = localStorage.getItem('ctWho') || ''; } catch {}
   return `<div class="card"><h2>Clinic Eligibility file</h2>
     <div class="small">${esc(se.meta.Location)} · data from ${esc(se.meta['Run Date'])}${S.E ? ` · ${num(S.E.counts.patients)} patients · ${num(S.E.counts.clinicTasks)} open tasks for you` : ''} · ${num(d.work.length)} change${d.work.length === 1 ? '' : 's'} on Clinic Work</div>
-    <div class="fld">Your name or initials (goes in By on Clinic Work)<input data-act="seWho" maxlength="60" value="${esc(who)}" placeholder="${esc('Clinic ' + se.meta.Location)}"></div>
+    <div class="row small" style="margin:8px 0">Your changes on Clinic Work say they’re by <b>${esc(seBy())}</b>.${S.askWho ? '<button class="btn sm" data-act="switchUser">Switch user</button>' : ''}</div>
     <div class="small muted">Central Sohar made this file for your clinic. It holds PHI (MRNs, insurance, visits): keep it in your clinic’s folder in the Clinic Eligibility library (MHS OneDrive or Teams only). Excel on the web saves your changes on its own and the admin picks them up from there, so you don’t need to send the file back. If the file isn’t in the library, or the admin asks for it, save it and send it to the admin through OneDrive or Teams. Don’t edit the hidden tabs.</div>
     <label class="ck" style="margin-top:8px"><input type="checkbox" data-act="seTemplates"${S.opts.templates === 'On' ? ' checked' : ''}> Show template tools <span class="small muted">(templates, cadence, recall and access; they need a NextGen appointment list)</span></label>
     <div class="small muted" style="margin-top:6px">Clinic Template Tool ${esc(APP_VERSION)} · Sohar file ${esc(se.meta['Sohar Version'])}</div></div>`;
@@ -928,15 +1062,27 @@ function navHTML(view){
   return top + sub;
 }
 
+// top right, flush: refresh, full screen (or exit), then the Dev Update bell, which docks in .du-slot (dev-updates.js).
+// data-tip is the hover label: what a press does. This tool has no light/dark toggle (it follows Windows).
+const ICON = {
+  refresh: '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v5h-5"/></svg>',
+  full: '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>',
+};
+function toolsHTML(){
+  const full = S.mode === 'dialog' ? `<button class="iconbtn" data-act="closeFull" data-tip="Exit full screen" aria-label="Exit full screen">${ICON.full}</button>`
+    : S.canFull ? `<button class="iconbtn" data-act="full" data-tip="Full screen" aria-label="Full screen">${ICON.full}</button>` : '';
+  return `<div class="tools"><button class="iconbtn" data-act="refresh" data-tip="Refresh" aria-label="Refresh">${ICON.refresh}</button>${full}<span class="du-slot"></span></div>`;
+}
 function render(){
   for (const k in CHARTS) delete CHARTS[k];
   if (S.err) { $('#app').innerHTML = `<main><div class="card"><h2>Can’t read the workbook</h2><div class="msg bad">${esc(S.err)}</div><button class="btn primary" data-act="refresh">Try again</button></div></main>`; return; }
-  if (!S.data) return;
+  if (!S.data) { $('#app').innerHTML = bootHTML(); return; }
+  if (mustPick()) { $('#app').innerHTML = pickHTML(); const f = $('#whoNew'); if (f && !S.users.length) f.focus(); return; }
   const view = currentView(); const se = SE_VIEWS.includes(view);
   const body = { overview: vOverview, templates: vTemplates, access: vAccess, cadence: vCadence, funnel: vFunnel, recall: vRecall, visits: vVisits, impact: vImpact, trends: vTrends, eligibility: vEligibility, benefits: vBenefits, payers: vPayers, setup: vSetup }[view]();
   $('#app').innerHTML = `<header class="top"><div class="bar"><div class="brand"><span class="dot" title="Clinic Template Tool ${esc(APP_VERSION)}">CT</span><span>Clinic Template Tool</span><small>${S.R && !se ? `${S.R.tByProv.size} templates · ${num(S.data.ap.rows.length)} visits` : ''}</small></div>
-    <button class="iconbtn" data-act="refresh" title="Re-read the workbook" aria-label="Refresh">⟳</button>
-    ${S.mode === 'pane' && S.canFull ? `<button class="iconbtn" data-act="full" title="Full screen" aria-label="Full screen">⛶</button>` : ''}${S.mode === 'dialog' ? `<button class="iconbtn" data-act="closeFull" title="Close full screen" aria-label="Close full screen">✕</button>` : ''}</div>
+    ${S.name ? `<button class="whoami" data-act="switchUser" title="Switch user"><b>${esc(S.name)}</b><small>Switch user</small></button>` : ''}
+    ${toolsHTML()}</div>
     ${navHTML(view)}
     ${se ? seHeadHTML() : S.R && view !== 'setup' ? filtersHTML() : ''}</header><main>${body}</main>`;
 }
@@ -950,6 +1096,10 @@ document.addEventListener('click', async e => {
     if (act === 'refresh') await reload();
     else if (act === 'full') openFull();
     else if (act === 'closeFull') S.store.close();
+    else if (act === 'pickUser') pickUser(a.dataset.v);
+    else if (act === 'addUser') await addUser();
+    else if (act === 'switchUser'){ S.picking = true; if (!$('#modal').hidden) closeModal(); render(); window.scrollTo(0, 0); }
+    else if (act === 'pickCancel'){ S.picking = false; render(); }
     else if (act === 'newTemplate') newTemplateDialog();
     else if (act === 'makeTemplate') await makeTemplate();
     else if (act === 'close' || act === 'askNo') closeModal();
@@ -973,6 +1123,8 @@ document.addEventListener('click', async e => {
     else if (act === 'sePayerNoteSave'){ const card = $('#seCard').value.trim(), note = $('#seNoteText').value.trim(); closeModal(); await seWrite({ Kind: 'Payer note', Key: a.dataset.p, Value: card, Note: note }); }
   } catch (err){ console.error(err); busy(false); toast('bad', esc(err.message || String(err)), 9000); }
 });
+// Enter in the add-name field adds it
+document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target && e.target.id === 'whoNew'){ e.preventDefault(); addUser().catch(err => { console.error(err); toast('bad', esc(err.message || String(err)), 9000); }); } });
 // search re-draws the list only, so the box keeps focus while typing
 document.addEventListener('input', e => { const t = e.target; if (t.dataset && t.dataset.act === 'seQ' && S.E){ S.seQ = t.value; const box = $('#seList'); if (box) box.innerHTML = seListHTML(); } });
 document.addEventListener('change', async e => {
@@ -993,7 +1145,6 @@ document.addEventListener('change', async e => {
     else if (act === 'seDone'){ const r = seRow(t.dataset.m); await seWrite({ Kind: 'Task done', Key: t.dataset.k, MRN: r.MRN, LASFIR: r.LASFIR, Value: t.checked ? 'Yes' : 'No' }); }
     else if (act === 'seRv'){ const r = seRow(t.dataset.m); await seWrite({ Kind: 'Re-verify anyway', Key: t.dataset.m, MRN: r.MRN, LASFIR: r.LASFIR, Value: t.checked ? 'On' : 'Off' }); }
     else if (act === 'seTemplates'){ S.opts.templates = t.checked ? 'On' : ''; await S.store.setDoc('ctOpts', S.opts); render(); }
-    else if (act === 'seWho'){ try { localStorage.setItem('ctWho', t.value.trim()); } catch {} }
   } catch (err){ console.error(err); busy(false); toast('bad', esc(err.message || String(err)), 9000); }
 });
 
@@ -1212,15 +1363,17 @@ async function downloadManifest(){
 
 (function boot(){
   S.mode = /[?&]mode=dialog\b/.test(location.search) ? 'dialog' : 'pane';
-  if (window.__TEST_STORE__){ S.store = window.__TEST_STORE__; S.canFull = true; reload(); return; }   // headless tests
+  // Dev Update bell: the pane passes seen ids to full screen (openFull sets its send); full screen sends them back up
+  const bell = send => { if (window.DevUpdates) DevUpdates.init({ app: 'ctt', send }); };
+  if (window.__TEST_STORE__){ S.store = window.__TEST_STORE__; S.canFull = true; S.askWho = true; bell(null); reload(); return; }   // headless tests
   if (typeof Office === 'undefined'){ $('#app').innerHTML = notInExcelHTML(); return; }
   let settled = false;
   Office.onReady(info => {
     settled = true;
-    if (S.mode === 'dialog'){ S.store = RemoteStore(); reload(); return; }   // the dialog has no Excel host of its own
+    if (S.mode === 'dialog'){ S.store = RemoteStore(); S.askWho = true; bell(m => S.store.send(m)); reload(); return; }   // the dialog has no Excel host of its own
     if (info.host !== Office.HostType.Excel){ $('#app').innerHTML = notInExcelHTML(); return; }
     try { S.canFull = Office.context.requirements.isSetSupported('DialogApi', '1.2'); } catch { S.canFull = false; }
-    S.store = OfficeStore(); reload();
+    S.store = OfficeStore(); S.askWho = true; bell(null); reload();
   });
   setTimeout(() => { if (!settled) $('#app').innerHTML = notInExcelHTML(); }, 4000);
 })();
