@@ -1,7 +1,7 @@
 // Clinic Template Tool: Excel add-in front end. Analysis lives in engine.js (TE).
 // Clinic Eligibility files use Sohar's own core.js / rules.js (SoharCore / SoharRules, byte-identical copies).
 'use strict';
-const APP_VERSION = '1.1.4';   // bump with every ?v= in taskpane.html
+const APP_VERSION = '1.1.5';   // bump with every ?v= in taskpane.html
 const SC = SoharCore, SR = SoharRules;
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -19,7 +19,7 @@ const SE_VIEWS = ['eligibility', 'benefits', 'payers'];   // need a Clinic Eligi
 const SE_WORK_TABLE = 'tblClinicWork';   // the Clinic Work table Sohar's clinicPack makes; the admin's Power Automate flow reads it
 const AUTO_SHOW = 'Office.AutoShowTaskpaneWithDocument';
 const S = { view: 'overview', data: null, R: null, f: { from: '', to: '', loc: '', prov: '', sl: '' }, opts: { lateHours: 24, target: 14, asOf: '', releaseHours: 24, convDays: 90, lapsedDays: 60, overdueMult: 1.5, tmsCount: 30, maintDays: 180, matchDays: 10, dayStart: '08:00', dayEnd: '18:00' }, heatMetric: 'fill', trendType: '', impactWhy: '', recallState: 'call', store: null, mode: 'pane', full: false,
-  SE: null, E: null, sub: {}, sePill: '', seQ: '', seBen: '', users: [], name: '', picking: false, askWho: false, boot: null };
+  SE: null, E: null, sub: {}, sePill: '', seQ: '', seBen: '', users: [], name: '', picking: false, askWho: false, boot: null, theme: '', themeSwap: false };
 
 // ---------- who's using the tool ----------
 // People add their name to the workbook (document setting ctUsers: [{ name, added }]); no sheet is added. This computer keeps, per
@@ -54,6 +54,26 @@ const whoToday = (rec, day) => rec && rec.day === day ? rec.name : '';
 const whoPick = (rec, name, day) => ({ day, name, used: [name].concat(((rec && rec.used) || []).filter(n => userKey(n) !== userKey(name))).slice(0, 20) });
 const dayIso = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 const LS = { get(k){ try { return localStorage.getItem(k) || ''; } catch { return ''; } }, set(k, v){ try { localStorage.setItem(k, v); } catch { /* this session only */ } } };
+
+// ---------- light / dark ----------
+// Kept per computer (localStorage ctTheme); with none saved it follows Windows (the CSS does too, so nothing flashes). Full
+// screen opens with the pane's (?theme= on its URL, because the dialog may not share the pane's storage) and each side tells
+// the other when it changes ({ ev: 'theme' }). Sets data-theme on <html>.
+const THEME_KEY = 'ctTheme';
+const okTheme = t => t === 'dark' || t === 'light';
+function startTheme(){
+  let t = '';
+  try { t = new URLSearchParams(location.search).get('theme') || ''; } catch { /* no URL here */ }
+  if (!okTheme(t)) t = LS.get(THEME_KEY);
+  if (!okTheme(t)) { try { t = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; } catch { t = 'light'; } }
+  return t;
+}
+function applyTheme(t, save){
+  if (!okTheme(t)) return;
+  S.themeSwap = S.themeSwap || (!!S.theme && S.theme !== t); S.theme = t;
+  try { document.documentElement.dataset.theme = t; } catch { /* no page (tests) */ }
+  if (save) LS.set(THEME_KEY, t);
+}
 function workbookKey(){
   let url = ''; try { url = Office.context.document.url || ''; } catch { /* no document */ }
   if (url) return wbKeyOf(url);
@@ -302,6 +322,7 @@ function RemoteStore(){
   const rx = makeRx(m => {
     if (window.DevUpdates && DevUpdates.receive(m)) return;
     if (m.ev === 'who'){ S.name = m.name || ''; S.picking = false; render(); return; }
+    if (m.ev === 'theme'){ applyTheme(m.theme, true); render(); S.themeSwap = false; return; }   // switched in the pane
     if (m.rid && pend.has(m.rid)){ const p = pend.get(m.rid); pend.delete(m.rid); m.ok ? p.res(m.res) : p.rej(new Error(m.err)); }
   });
   Office.context.ui.addHandlerAsync(Office.EventType.DialogParentMessageReceived, a => rx(a.message));
@@ -321,10 +342,10 @@ let DLG = null, toChild = null;
 const closedFull = () => { DLG = null; toChild = null; S.full = false; if (window.DevUpdates) DevUpdates.setSend(null); reload(); };
 function openFull(){
   if (DLG || S.mode !== 'pane') return;
-  const base = location.href.replace(/[?#].*$/, '') + '?mode=dialog';
+  const base = location.href.replace(/[?#].*$/, '') + '?mode=dialog&theme=' + S.theme;   // opens in the pane's light / dark
   // the Dev Updates already dismissed here go along, so full screen doesn't show them again
   const url = window.DevUpdates ? DevUpdates.dialogUrl(base) : base;
-  Office.context.ui.displayDialogAsync(url, { height: 96, width: 96, displayInIframe: true }, res => {
+  Office.context.ui.displayDialogAsync(url, { height: 95, width: 95, displayInIframe: true }, res => {
     if (res.status !== Office.AsyncResultStatus.Succeeded){ toast('bad', 'Couldn’t open full screen: ' + esc(res.error && res.error.message)); return; }
     DLG = res.value; S.full = true; render();
     const reply = obj => { try { sendChunks(s => DLG && DLG.messageChild(s), obj); } catch (e){ console.error(e); } };
@@ -333,6 +354,7 @@ function openFull(){
       if (window.DevUpdates && DevUpdates.receive(m)) return;   // a Dev Update dismissed in full screen
       if (m.ev === 'close'){ try { DLG.close(); } catch {} closedFull(); return; }
       if (m.ev === 'who'){ setWho(m.name); render(); return; }   // switched user in full screen
+      if (m.ev === 'theme'){ applyTheme(m.theme, true); render(); S.themeSwap = false; return; }   // light / dark switched in full screen
       const { rid, op, args } = m;
       try {
         if (!RELAY_OPS.includes(op)) throw new Error('Unknown request');
@@ -526,7 +548,7 @@ document.addEventListener('mousemove', e => {
 });
 const SEQ = ['var(--q1)', 'var(--q2)', 'var(--q3)', 'var(--q4)', 'var(--q5)', 'var(--q6)', 'var(--q7)'];
 const seq = f => f == null ? 'transparent' : SEQ[Math.max(0, Math.min(6, Math.floor(f * 7 - 1e-9)))];
-const seqInk = f => f != null && f > 0.57 ? '#fff' : 'var(--ink)';
+const seqInk = f => f != null && f > 0.57 ? 'var(--q-hi-ink)' : 'var(--ink)';
 const barCell = (v, max, label) => `<td class="n bar-cell"><i style="width:${max ? Math.max(0, Math.min(100, 100 * v / max)) : 0}%"></i><span>${label}</span></td>`;
 
 // ---------- views ----------
@@ -1062,16 +1084,21 @@ function navHTML(view){
   return top + sub;
 }
 
-// top right, flush: refresh, full screen (or exit). The Dev Update bell floats (dev-updates.js): bottom right, draggable.
-// data-tip is the hover label: what a press does. This tool has no light/dark toggle (it follows Windows).
+// top right, flush: refresh, full screen (or exit), light / dark (the IVK Tracker's). data-tip is the hover label: what a press
+// does; the theme's is the mode a press switches to. The sun and moon swap places on a change: the one on the right is the
+// one to press. The Dev Update bell is not in the toolbar: in full screen it sits right of the name (.du-home).
 const ICON = {
   refresh: '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v5h-5"/></svg>',
   full: '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>',
+  moon: '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>',
+  sun: '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',
 };
 function toolsHTML(){
   const full = S.mode === 'dialog' ? `<button class="iconbtn" data-act="closeFull" data-tip="Exit full screen" aria-label="Exit full screen">${ICON.full}</button>`
     : S.canFull ? `<button class="iconbtn" data-act="full" data-tip="Full screen" aria-label="Full screen">${ICON.full}</button>` : '';
-  return `<div class="tools"><button class="iconbtn" data-act="refresh" data-tip="Refresh" aria-label="Refresh">${ICON.refresh}</button>${full}</div>`;
+  const dark = S.theme === 'dark', tl = dark ? 'Light mode' : 'Dark mode';
+  const theme = `<button class="iconbtn theme${dark ? ' is-dark' : ''}${S.themeSwap ? ' swap' : ''}" data-act="theme" data-tip="${tl}" aria-label="Switch to ${tl.toLowerCase()}" aria-pressed="${dark}">${dark ? `<span class="tcur">${ICON.moon}</span><span class="tsl">/</span><span class="tgo">${ICON.sun}</span>` : `<span class="tcur">${ICON.sun}</span><span class="tsl">/</span><span class="tgo">${ICON.moon}</span>`}</button>`;
+  return `<div class="tools"><button class="iconbtn" data-act="refresh" data-tip="Refresh" aria-label="Refresh">${ICON.refresh}</button>${full}${theme}</div>`;
 }
 function render(){
   for (const k in CHARTS) delete CHARTS[k];
@@ -1080,7 +1107,7 @@ function render(){
   if (mustPick()) { $('#app').innerHTML = pickHTML(); const f = $('#whoNew'); if (f && !S.users.length) f.focus(); return; }
   const view = currentView(); const se = SE_VIEWS.includes(view);
   const body = { overview: vOverview, templates: vTemplates, access: vAccess, cadence: vCadence, funnel: vFunnel, recall: vRecall, visits: vVisits, impact: vImpact, trends: vTrends, eligibility: vEligibility, benefits: vBenefits, payers: vPayers, setup: vSetup }[view]();
-  $('#app').innerHTML = `<header class="top"><div class="bar"><div class="brand"><span class="dot" title="Clinic Template Tool ${esc(APP_VERSION)}">CT</span><span>Clinic Template Tool</span><small>${S.R && !se ? `${S.R.tByProv.size} templates · ${num(S.data.ap.rows.length)} visits` : ''}</small></div>
+  $('#app').innerHTML = `<header class="top"><div class="bar"><div class="brand"><span class="dot" title="Clinic Template Tool ${esc(APP_VERSION)}">CT</span><span class="bname">Clinic Template Tool</span>${S.mode === 'dialog' ? '<span class="du-home" aria-hidden="true"></span>' : ''}<small>${S.R && !se ? `${S.R.tByProv.size} templates · ${num(S.data.ap.rows.length)} visits` : ''}</small></div>
     ${S.name ? `<button class="whoami" data-act="switchUser" title="Switch user"><b>${esc(S.name)}</b><small>Switch user</small></button>` : ''}
     ${toolsHTML()}</div>
     ${navHTML(view)}
@@ -1096,6 +1123,10 @@ document.addEventListener('click', async e => {
     if (act === 'refresh') await reload();
     else if (act === 'full') openFull();
     else if (act === 'closeFull') S.store.close();
+    else if (act === 'theme'){
+      applyTheme(S.theme === 'dark' ? 'light' : 'dark', true); render(); S.themeSwap = false;
+      if (S.mode === 'dialog'){ if (S.store && S.store.send) S.store.send({ ev: 'theme', theme: S.theme }); } else if (toChild) toChild({ ev: 'theme', theme: S.theme });
+    }
     else if (act === 'pickUser') pickUser(a.dataset.v);
     else if (act === 'addUser') await addUser();
     else if (act === 'switchUser'){ S.picking = true; if (!$('#modal').hidden) closeModal(); render(); window.scrollTo(0, 0); }
@@ -1363,6 +1394,7 @@ async function downloadManifest(){
 
 (function boot(){
   S.mode = /[?&]mode=dialog\b/.test(location.search) ? 'dialog' : 'pane';
+  applyTheme(startTheme(), false); S.themeSwap = false;
   // Dev Update bell: the pane passes seen ids to full screen (openFull sets its send); full screen sends them back up
   const bell = send => { if (window.DevUpdates) DevUpdates.init({ app: 'ctt', send }); };
   if (window.__TEST_STORE__){ S.store = window.__TEST_STORE__; S.canFull = true; S.askWho = true; bell(null); reload(); return; }   // headless tests

@@ -135,3 +135,37 @@ test('OfficeStore.addUser re-reads saved settings first, so a name added elsewhe
   eq(list.map(u => u.name), ['Ana', 'Ben', 'Cam']);
   eq(saved.ctUsers.map(u => u.name), ['Ana', 'Ben', 'Cam']);
 });
+
+test('toolbar: refresh, full screen, light / dark; the theme is kept and passed both ways; the bell home is full screen only', async () => {
+  const o = loadApp({ docs: { ctUsers: [{ name: 'Ana', added: '2026-11-01' }], ctWbId: 'id-t' } });
+  o.api.S.canFull = true; await o.api.reload(); await o.click('pickUser', { v: 'Ana' });
+  let h = html(o);
+  const tools = h.slice(h.indexOf('<div class="tools">'));
+  const acts = [...tools.matchAll(/<button class="iconbtn[^"]*" data-act="(\w+)" data-tip="([^"]+)"/g)].map(m => [m[1], m[2]]);
+  eq(acts, [['refresh', 'Refresh'], ['full', 'Full screen'], ['theme', 'Dark mode']]);
+  assert.ok(tools.includes('<span class="tcur"><svg') && tools.includes('<span class="tsl">/</span><span class="tgo"><svg'), 'whole sun and moon with the slash');
+  assert.ok(!h.includes('du-home'), 'no bell home in the pane');
+  const sent = []; o.api.S.mode = 'pane';
+  await o.click('theme');
+  assert.equal(o.api.S.theme, 'dark'); assert.equal(o.sandbox.localStorage.getItem('ctTheme'), 'dark');
+  h = html(o); assert.ok(h.includes('data-tip="Light mode"') && h.includes('aria-pressed="true"') && / swap"/.test(h), 'swap animation on the change');
+  // full screen: the home spot right of the name, and the theme goes up to the pane
+  o.api.S.mode = 'dialog'; o.api.S.store.send = m => sent.push(m); o.api.S.store.close = () => {};
+  o.api.render(); h = html(o);
+  assert.ok(/<span class="bname">Clinic Template Tool<\/span><span class="du-home" aria-hidden="true"><\/span>/.test(h), 'du-home right of the name');
+  assert.ok(h.includes('data-act="closeFull" data-tip="Exit full screen"'));
+  await o.click('theme'); eq(sent, [{ ev: 'theme', theme: 'light' }]);
+  // the loading and name screens have no home spot
+  o.api.S.picking = true; o.api.render(); assert.ok(!html(o).includes('du-home'));
+  const src = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
+  assert.ok(src.includes("displayDialogAsync(url, { height: 95, width: 95, displayInIframe: true }") && !/displayInIframe: false/.test(src), 'in-page dialog only');
+  assert.ok(src.includes("'?mode=dialog&theme=' + S.theme"), 'full screen opens in the pane’s theme');
+});
+
+test('release: APP_VERSION, package.json and every ?v= agree', () => {
+  const v = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8').match(/const APP_VERSION = '([\d.]+)'/)[1];
+  assert.equal(v, '1.1.5');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version, v);
+  const found = [...fs.readFileSync(path.join(__dirname, '..', 'taskpane.html'), 'utf8').matchAll(/\?v=([\d.]+)/g)].map(m => m[1]);
+  assert.ok(found.length); eq([...new Set(found)], [v]);
+});
