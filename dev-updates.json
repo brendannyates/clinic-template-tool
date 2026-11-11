@@ -1,6 +1,14 @@
 {
   "updates": [
     {
+      "id": "2026-11-11-start-here",
+      "date": "2026-11-11",
+      "bullets": [
+        "Changed: Your clinic workbook now opens on a Start Here page, with your clinic's appointment list for templates, access (3NA), cadence and recall. Patients show as LASFIR only.",
+        "Changed: Eligibility, benefits and billing tickets are worked centrally for now, so the Clinic Day tab isn't in new clinic files."
+      ]
+    },
+    {
       "id": "2026-11-10-clinic-day",
       "date": "2026-11-10",
       "bullets": [

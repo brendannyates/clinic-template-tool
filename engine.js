@@ -96,7 +96,9 @@
   // Same rule as the MHS Confirmations tool: a name not in "Last, First" form gets no code rather than a guess.
   const letters = s => String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Za-z]/g, '');
   function lasfir(raw){
-    const s = txt(raw); const i = s.indexOf(','); if (i < 0) return '';
+    const s = txt(raw);
+    if (/^[A-Z]{2,6}$/.test(s)) return s;   // already a LASFIR code (the Sohar clinic workbook's Appointment List)
+    const i = s.indexOf(','); if (i < 0) return '';
     const last = letters(s.slice(0, i)), first = letters(s.slice(i + 1).replace(/\([^)]*\)/g, '').trim().split(/\s+/)[0] || '');
     return last && first ? (last.slice(0, 3) + first.slice(0, 3)).toUpperCase() : '';
   }
@@ -272,7 +274,8 @@
     cancel: /^(cancel(l)?(ed)?\s*(date|on|dt|date\/time|timestamp)?|date\s*cancel(l)?(ed)?|cxl\s*(date|dt))$/i,
     cancelTime: /^(cancel(l)?(ed)?\s*time|cxl\s*time)$/i,
     reason: /^(cancel(l)?(ation)?\s*reason|reason|cxl\s*reason|cancel\s*code)$/i,
-    pt: /^((pat\.?|patient|pt\.?|person)\s*name|patient)$/i,
+    // Sohar v0.30 clinic workbooks carry LASFIR, never names
+    pt: /^((pat\.?|patient|pt\.?|person)\s*name|patient|lasfir)$/i,
     payer: /^(payer\s*name(\s*\(cht\s*guar\))?|primary\s*(payer|insurance)|payer|insurance)$/i,
     mrn: /^(md\s*rc|med\.?\s*rec(\.|ord)?\s*(nbr|no\.?|#|number)?|mrn|person\s*(nbr|no\.?|#|number|id)|patient\s*(id|nbr|no\.?|#|number)|chart\s*(nbr|no\.?|#|number))$/i,
   };
