@@ -1,7 +1,7 @@
 // Clinic Template Tool: Excel add-in front end. Analysis lives in engine.js (TE).
 // Clinic Eligibility files use Sohar's own core.js / rules.js (SoharCore / SoharRules, byte-identical copies).
 'use strict';
-const APP_VERSION = '1.1.5';   // bump with every ?v= in taskpane.html
+const APP_VERSION = '1.2.0';   // bump with every ?v= in taskpane.html
 const SC = SoharCore, SR = SoharRules;
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -201,7 +201,8 @@ function OfficeStore(){
       const out = { names: info.map(x => x.name), grids: {}, cfg: {}, appt: null, hidden: info.filter(x => x.hidden).map(x => x.name) };
       // a Clinic Eligibility file (it has SE Info): its own sheets are data, never templates or the appointment list
       const seFile = info.some(x => x.name.toLowerCase() === SR.SE_SHEETS.info.toLowerCase());
-      const seNames = Object.values(SR.SE_SHEETS).map(n => n.toLowerCase());
+      // Sohar v0.29 (CTT 1.2.0): the v2 sheets (Clinic Day, SE Appointments, SE Estimates, ...) are the file's own too
+      const seNames = Object.values(SR.SE_SHEETS).concat(Object.values(SR.SE2_SHEETS || {})).map(n => n.toLowerCase());
       const isSE = x => seFile && seNames.includes(x.name.toLowerCase());
       const apptX = info.find(x => !isSE(x) && !x.hidden && dims(x) && /^(appointment list|appt list)/i.test(x.name)) || info.find(x => !isSE(x) && dims(x) && /appointment|appt/i.test(x.name) && dims(x).rows > 50);
       const cfgKey = n => (Object.entries(SHEETS).find(([k, v]) => k !== 'appt' && v.toLowerCase() === n.toLowerCase()) || [])[0];
@@ -453,6 +454,29 @@ function runCadence(co){
 function runSE(){
   S.E = null; S.Eerr = null; if (!S.SE) return;
   try { S.E = SR.clinicDerive(S.SE, S.data.work, new Date()); } catch (e){ console.error(e); S.Eerr = e.message || String(e); }
+  if (!S.E) return;
+  // 1.2.0: visits the rotation has not priced get an estimate from the file's own fee tables (pricing.js, Sohar's fees.js)
+  if (S.priceFor !== S.SE){ S.priceFor = S.SE; S.priceOf = typeof CTTPricing !== 'undefined' && typeof SoharFees !== 'undefined' ? CTTPricing.pricer(S.SE, { SR, SF: SoharFees, SC }) : null; }
+  const day = SR.clinicDay ? SR.clinicDay(S.E, { priceOf: S.priceOf || undefined }) : [];
+  S.dayByAppt = new Map((S.E.appts || []).map((a, i) => [a, day[i]]));
+  seDayQueue(day);
+}
+// Clinic Day (1.2.0): the visible sheet is a view of the hidden tables and Clinic Work, rewritten here after each change.
+// Only the pane writes it (full screen relays its changes to the pane), and only when the file has it: the file's
+// structure may be locked, so no sheet is ever made here.
+let dayT = null, dayLast = '';
+function seDayQueue(day){
+  if (!S.store || !S.store.live || S.mode === 'dialog' || !SR.SE2_SHEETS) return;
+  const name = SR.SE2_SHEETS.day;
+  if (!(S.data.names || []).some(n => n.toLowerCase() === name.toLowerCase())) return;
+  const aoa = [SR.CLINIC_DAY_COLS].concat(day.map(r => SR.CLINIC_DAY_COLS.map(c => r[c])));
+  const sig = JSON.stringify(aoa); if (sig === dayLast) return;
+  clearTimeout(dayT);
+  dayT = setTimeout(() => {
+    const p = workQ.then(() => S.store.writeSheet(name, aoa, { keepFormat: true, inPlace: true, text: true, table: 'tblClinicDay' }));
+    workQ = p.catch(() => {});
+    p.then(() => { dayLast = sig; }, e => console.warn('Clinic Day not written', e));
+  }, S.dayDelay == null ? 1200 : S.dayDelay);
 }
 // the loading screen on first open: each step ticks as its read finishes (OfficeStore.load), then the templates are measured
 const BOOT = ['Connecting to the workbook', 'Looking for template grids', 'Reading Slot Types, Ref and Providers', 'Reading the appointment list', 'Measuring the templates'];
@@ -856,9 +880,10 @@ function vEligibility(){
   if (S.sePill && !(S.sePill === 'tasks' ? withTasks : count.has(S.sePill))) S.sePill = '';
   const chip = (v, label, n, cls) => `<button class="chip ${cls}" data-act="sePill" data-v="${esc(v)}" aria-pressed="${S.sePill === v}">${esc(label)} ${num(n)}</button>`;
   return `<div class="card"><h2>Eligibility <span class="chip mute">${num(rows.length)} patients</span></h2>
-    <div class="small muted">Everyone whose next visit is here, soonest first. Do the tasks before the visit. Your ticks, re-verify requests and notes are saved on the Clinic Work tab, and the admin picks them up from your clinic’s folder.</div>
+    <div class="small muted">Everyone with a visit booked here (patients from other clinics too), soonest first. Do the tasks before the visit. Your ticks, re-verify requests and notes are saved on the Clinic Work tab, and the admin picks them up from your clinic’s folder.</div>
     <div class="chips">${chip('', 'All', rows.length, 'mute')}${withTasks ? chip('tasks', 'Has tasks', withTasks, 'warn') : ''}${SR.PILLS.filter(p => count.has(p.label)).map(p => chip(p.label, p.label, count.get(p.label), PILL_CHIP[p.color] || 'mute')).join('')}</div>
     <input type="search" class="sesearch" data-act="seQ" value="${esc(S.seQ)}" placeholder="Search LASFIR or MRN" aria-label="Search LASFIR or MRN"></div>
+  ${lookupCardHTML()}
   <div id="seList">${seListHTML(T)}</div>`;
 }
 function seListHTML(T = seTaskMap()){
@@ -889,14 +914,112 @@ function ptCard(r, T){
       ${r.Copay !== '' || r.Coinsurance !== '' ? `<dt>Copay</dt><dd>${r.Copay !== '' ? esc(usd(r.Copay) || r.Copay) : '—'}${r.Coinsurance !== '' ? ` · coinsurance ${esc(r.Coinsurance)}` : ''}</dd>` : ''}</dl>
     ${ben}
     ${items.length ? `<ul class="items">${items.map(t => `<li class="sev-${esc(t.severity || 'high')}">${SEV_WORD[t.severity] ? `<b>${SEV_WORD[t.severity]}:</b> ` : ''}${esc(t.detail)}</li>`).join('')}</ul>` : ''}
+    ${seVisitsHTML(r)}${seMoneyHTML(r)}
     ${mine.map(seTaskHTML).join('')}
     ${adminOpen ? `<div class="small muted">${num(adminOpen)} more task${adminOpen === 1 ? '' : 's'} for the admin.</div>` : ''}
     ${r['Verification Skipped'] || r['Re-verify Anyway'] ? `<div class="msg info small">${r['Verification Skipped'] ? `${esc(r['Verification Skipped'])}, so this patient isn’t on this week’s verification file (next check ${esc(r['Next Check'] || '?')}).` : 'Verified recently.'}
       <label class="ck"><input type="checkbox" data-act="seRv" data-m="${k}"${r['Re-verify Anyway'] ? ' checked' : ''}> Re-verify anyway (new card, or another reason to check)</label></div>` : ''}
     ${note ? `<div class="msg info small"><b>Your note:</b> ${esc(note.Note)} <span class="muted">· ${esc(note.By)}${seWhen(note.When) ? ', ' + esc(seWhen(note.When)) : ''}</span></div>` : ''}
     ${notes.length ? `<details class="more"><summary>Sohar notes (${notes.length})</summary><ul class="items">${notes.map(t => `<li>${esc(t)}</li>`).join('')}</ul></details>` : ''}
-    <div class="pt-act"><button class="btn sm" data-act="seNote" data-m="${k}">${note ? 'Edit note' : 'Add note'}</button></div>
+    ${seHistoryHTML(r)}
+    <div class="pt-act"><button class="btn sm" data-act="seNote" data-m="${k}">${note ? 'Edit note' : 'Add note'}</button>${S.E.appts ? `<button class="btn sm" data-act="seCollect" data-m="${k}">Record a collection</button>` : ''}${lookupReady() ? `<button class="btn sm" data-act="seMore" data-m="${k}">More detail</button>` : ''}</div>
   </div>`;
+}
+// ---------- 1.2.0: visits here, card on file, OK to collect, desk collections, history ----------
+const seWd = s => { const d = SC.parseDate(s); return d ? d.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' }) : ''; };
+function seVisitsHTML(r){
+  const list = (S.E.appts || []).filter(a => a.Key === r.key);
+  if (!list.length) return '';
+  return `<ul class="visits">${list.map(a => { const d = (S.dayByAppt && S.dayByAppt.get(a)) || {};
+    const owes = String(d['Est. owes'] || ''), amt = /^\$/.test(owes);
+    const line = [owes ? (amt ? `Owes about <b>${esc(owes)}</b>` : esc(owes)) : '', d['Copay activity'] ? esc(d['Copay activity']) : ''].filter(Boolean).join(' · ');
+    return `<li><b>${esc(seWd(a.Date))} ${esc(String(a.Date).replace(/\/\d{4}$/, ''))} ${esc(a.Time)}</b> · ${esc(a.Event)}${a.Provider ? ` · ${esc(a.Provider)}` : ''}${line ? `<br><span class="small">${line}</span>` : ''}</li>`; }).join('')}</ul>`;
+}
+function seMoneyHTML(r){
+  if (!S.E.copay) return '';
+  const c = S.E.copay.get(r.key) || {}, card = String(c['Card On File'] || ''), ok = String(c['OK to Collect'] || '');
+  const k = esc(r.key), on = v => (/^yes$/i.test(ok) ? v === 'Yes' : /^no$/i.test(ok) ? v === 'No' : false);
+  const cardChip = /^y/i.test(card) ? '<span class="chip ok">Card on file</span>' : /^n/i.test(card) ? '<span class="chip warn">No card on file</span>' : '<span class="chip mute">Card on file: not checked</span>';
+  const who = ok ? `<span class="small muted">${esc(c['Consent By'] || '')}${seWhen(c['Consent When']) ? `, ${esc(seWhen(c['Consent When']))}` : ''}${c.consentFrom === 'admin' && c['Consent Location'] && c['Consent Location'] !== S.SE.meta.Location ? ` at ${esc(c['Consent Location'])}` : ''}</span>` : '';
+  return `<div class="money"><div class="chips">${cardChip}</div>
+    <div class="row okc" role="group" aria-label="OK to collect the copay for ${esc(r.LASFIR || r.key)}"><span class="small"><b>OK to collect</b> (patient said yes to the copay)</span>
+      <button class="chip ${on('Yes') ? 'ok' : 'mute'}" data-act="seOk" data-m="${k}" data-v="Yes" aria-pressed="${on('Yes')}">Yes</button>
+      <button class="chip ${on('No') ? 'bad' : 'mute'}" data-act="seOk" data-m="${k}" data-v="No" aria-pressed="${on('No')}">No</button>${who}</div></div>`;
+}
+function seHistoryHTML(r){
+  const h = (S.E.history && S.E.history.get(r.key)) || [];
+  if (!h.length) return '';
+  const when = v => { const s = String(v || ''); return /T\d/.test(s) ? seWhen(s) : s.replace(/\/\d{4}$/, ''); };
+  return `<details class="more"><summary>History (${h.length})</summary><ul class="items hist">${h.map(e => `<li><span class="muted">${esc(when(e.When))}</span> · <b>${esc(e.Kind)}</b>${e.Detail ? ` · ${esc(e.Detail)}` : ''}${e.Amount ? ` · ${esc(SR.money(e.Amount))}` : ''}${e.Location && e.Location !== S.SE.meta.Location ? ` <span class="small muted">(${esc(e.Location)})</span>` : ''}${e.pending ? ` <span class="chip warn">pending</span> <button class="btn sm" data-act="seCollectUndo" data-m="${esc(r.key)}" data-k="${esc(e.workKey)}">Undo</button>` : ''}</li>`).join('')}</ul></details>`;
+}
+const COLLECT_METHODS = ['Card in LumaPay', 'Card at the desk', 'Cash', 'Check'];
+function seCollectDialog(key){
+  const r = seRow(key); if (!r.key) return;
+  openModal(`<h2>Record a collection · ${seTag(r)} · ${seId(r)}</h2>
+    <div class="fld">Amount<input id="seAmt" type="number" min="0.01" step="0.01" inputmode="decimal"></div>
+    <div class="fld">How they paid<select id="seMethod">${COLLECT_METHODS.map(m => `<option>${esc(m)}</option>`).join('')}</select></div>
+    <div class="fld">Note (optional)<input id="seCollectNote" maxlength="200" placeholder="For example: copay for today"></div>
+    <div class="small muted">Saved on the Clinic Work tab and shown as pending until the admin applies it. LASFIR and MRN are enough: don’t type the patient’s name, date of birth or card numbers.</div>
+    <div class="row" style="margin-top:12px"><button class="btn primary" data-act="seCollectSave" data-m="${esc(key)}">Save</button><button class="btn" data-act="close">Cancel</button></div>`);
+}
+async function seCollectSave(key){
+  const r = seRow(key), amt = Number(String($('#seAmt').value || '').replace(/[$,\s]/g, ''));
+  if (!isFinite(amt) || amt <= 0) throw new Error('Type the amount collected, for example 30 or 30.00.');
+  const method = $('#seMethod').value, extra = String($('#seCollectNote').value || '').trim().replace(/\b(?:\d[ -]?){12,19}\b/g, '[card number removed]');
+  closeModal();
+  await seWrite({ Kind: 'Collected', Key: `${r.key}|${new Date().toISOString()}`, MRN: r.MRN, LASFIR: r.LASFIR, Value: amt.toFixed(2), Note: [method, extra].filter(Boolean).join(' · ') });
+}
+
+// ---------- 1.2.0: patient lookup (lookup.js; the only network call, to one flow address) ----------
+function lookupCfg(){ try { const v = JSON.parse(LS.get(typeof CTTLookup !== 'undefined' ? CTTLookup.STORE_KEY : 'cttLookup') || 'null'); return v && typeof v === 'object' ? v : null; } catch { return null; } }
+function lookupReady(){ return typeof CTTLookup !== 'undefined' && !!CTTLookup.LOOKUP_HOST && !!S.SE && CTTLookup.checkSetup(lookupCfg() || {}).ok; }
+function lookupSetupHTML(){
+  if (typeof CTTLookup === 'undefined' || !CTTLookup.LOOKUP_HOST) return '';
+  const ready = lookupReady();
+  return `<h3>Patient lookup</h3><div class="small">${ready ? 'Set up on this computer.' : 'Not set up on this computer.'} The lookup shows a patient who isn’t on this file’s list, or more detail for one who is. The admin sets it up once per computer with the clinic’s own address and key.</div>
+    <div class="row" style="margin-top:6px"><button class="btn sm" data-act="lkSetup">${ready ? 'Change' : 'Set up'}</button>${ready ? '<button class="btn sm" data-act="lkForget">Remove from this computer</button>' : ''}</div>`;
+}
+function lookupSetupDialog(){
+  openModal(`<h2>Patient lookup on this computer</h2>
+    <div class="fld">Lookup address<input id="lkUrl" type="url" autocomplete="off" spellcheck="false"></div>
+    <div class="fld">Clinic key<input id="lkKey" type="password" autocomplete="off" spellcheck="false"></div>
+    <div class="small muted">The admin types these. They stay in this browser on this computer only, never in the workbook. Don’t paste them in chat or email.</div>
+    <div class="row" style="margin-top:12px"><button class="btn primary" data-act="lkSave">Save</button><button class="btn" data-act="close">Cancel</button></div>`);
+}
+function lookupSave(){
+  const cfg = { url: String($('#lkUrl').value || '').trim(), key: String($('#lkKey').value || '').trim() };
+  const ok = CTTLookup.checkSetup(cfg); if (!ok.ok) throw new Error(ok.error);
+  LS.set(CTTLookup.STORE_KEY, JSON.stringify(cfg)); closeModal(); toast('ok', 'Patient lookup is set up on this computer.'); render();
+}
+function lookupCardHTML(){
+  if (!lookupReady()) return '';
+  return `<div class="card"><h2>Look up a patient</h2><div class="small muted">For a patient who isn’t on this list (walk-in, phone call). Every lookup is logged with your name and reason, and nothing it shows is saved in this file.</div>
+    <div class="fld">MRN<input id="lkMrn" inputmode="numeric" autocomplete="off" style="max-width:140px"></div>
+    <div class="fld">Why you need it<select id="lkReason"><option value="">Pick one</option>${CTTLookup.REASONS.map(x => `<option>${esc(x)}</option>`).join('')}</select></div>
+    <div class="fld">Note (needed for Other, or when the patient is new to this clinic)<input id="lkNote" maxlength="300" autocomplete="off"></div>
+    <div class="row" style="margin-top:6px"><button class="btn primary sm" data-act="lkGo">Look up</button></div></div>`;
+}
+async function lookupRun(q){
+  const body = CTTLookup.buildRequest(Object.assign({ staff: seBy() === `Clinic ${S.SE.meta.Location}` ? '' : seBy() }, q));
+  busy(true, 'Looking up…');
+  let res; try { res = await CTTLookup.call((u, o) => fetch(u, o), lookupCfg(), body); } finally { busy(false); }
+  S.lk = { q: Object.assign({}, q), res };   // memory only: dropped when the box closes
+  lookupResultDialog();
+}
+function lookupResultDialog(){
+  const { q, res } = S.lk || {}; if (!res) return;
+  const p = res.patient, f = (k, l) => (p && p[k] ? `<dt>${l}</dt><dd>${esc(p[k])}</dd>` : '');
+  const tierText = { scheduled: 'On this clinic’s list.', 'seen-12mo': 'Seen at this clinic in the last 12 months.', 'no-history': 'No history at this clinic.', 'not-found': 'Not in the eligibility master yet.' }[res.tier] || '';
+  const body = !res.ok && res.needNote ? `<div class="msg warn">${esc(res.message || 'This patient has no history at this clinic. Add a note saying why you need the details.')}</div>
+      <div class="fld">Note<input id="lkNote2" maxlength="300"></div><div class="row"><button class="btn primary" data-act="lkRetry">Look up</button><button class="btn" data-act="lkClose">Cancel</button></div>`
+    : !res.ok ? `<div class="msg bad">${esc(res.message || res.error || 'The lookup didn’t work.')}</div><div class="row"><button class="btn" data-act="lkClose">Close</button></div>`
+    : res.tier === 'not-found' ? `<div class="msg info">${esc(res.message || 'This MRN isn’t in the eligibility master.')}</div>
+      ${res.queued ? '<div class="msg ok">Added to the next eligibility check.</div>' : '<div class="row"><button class="btn primary" data-act="lkCheck">Request eligibility check</button></div>'}<div class="row"><button class="btn" data-act="lkClose">Close</button></div>`
+    : `<div class="small muted">${esc(tierText)} ${p && p['As Of'] ? `Data as of ${esc(p['As Of'])}.` : ''} Shown here only: nothing is saved in this file.</div>
+      <dl>${f('Coverage', 'Coverage')}${f('Payer', 'Payer')}${f('Plan', 'Plan')}${f('Copay', 'Copay')}${f('Coinsurance', 'Coinsurance')}${f('Deductible Remaining', 'Deductible left')}${f('OOP Remaining', 'OOP max left')}${f('Card On File', 'Card on file')}${f('OK to Collect', 'OK to collect')}${f('Next Visit Here', 'Next visit here')}</dl>
+      ${res.history.length ? `<h3>Recent</h3><ul class="items">${res.history.map(h => `<li>${esc(h.When)} · <b>${esc(h.Kind)}</b>${h.Detail ? ` · ${esc(h.Detail)}` : ''}${h.Amount ? ` · ${esc(SR.money(h.Amount))}` : ''}</li>`).join('')}</ul>` : ''}
+      ${res.message ? `<div class="small muted">${esc(res.message)}</div>` : ''}<div class="row"><button class="btn" data-act="lkClose">Close</button></div>`;
+  openModal(`<h2>${p && p.LASFIR ? esc(p.LASFIR) + ' · ' : ''}MRN ${esc(q.mrn)}</h2>${body}`);
 }
 // a clinic task: the Done tick, and next to it the done note (the Note on the task's Clinic Work "Task done" row). Under it, the
 // task's Clinic Note on the admin's NextGen Tasks when the file was made (sentNote, from SE Done): what the admin already has.
@@ -1017,6 +1140,7 @@ function seSetupCard(){
     <div class="small">${esc(se.meta.Location)} · data from ${esc(se.meta['Run Date'])}${S.E ? ` · ${num(S.E.counts.patients)} patients · ${num(S.E.counts.clinicTasks)} open tasks for you` : ''} · ${num(d.work.length)} change${d.work.length === 1 ? '' : 's'} on Clinic Work</div>
     <div class="row small" style="margin:8px 0">Your changes on Clinic Work say they’re by <b>${esc(seBy())}</b>.${S.askWho ? '<button class="btn sm" data-act="switchUser">Switch user</button>' : ''}</div>
     <div class="small muted">Central Sohar made this file for your clinic. It holds PHI (MRNs, insurance, visits): keep it in your clinic’s folder in the Clinic Eligibility library (MHS OneDrive or Teams only). Excel on the web saves your changes on its own and the admin picks them up from there, so you don’t need to send the file back. If the file isn’t in the library, or the admin asks for it, save it and send it to the admin through OneDrive or Teams. Don’t edit the hidden tabs.</div>
+    ${lookupSetupHTML()}
     <label class="ck" style="margin-top:8px"><input type="checkbox" data-act="seTemplates"${S.opts.templates === 'On' ? ' checked' : ''}> Show template tools <span class="small muted">(templates, cadence, recall and access; they need a NextGen appointment list)</span></label>
     <div class="small muted" style="margin-top:6px">Clinic Template Tool ${esc(APP_VERSION)} · Sohar file ${esc(se.meta['Sohar Version'])}</div></div>`;
 }
@@ -1152,6 +1276,19 @@ document.addEventListener('click', async e => {
     // no Value: workRows keeps the tick as it is (a note-only row leaves Done alone)
     else if (act === 'seTaskNoteSave'){ const k = a.dataset.k, r = seRow(k.split('|')[0]), note = $('#seNoteText').value.trim(); closeModal(); await seWrite({ Kind: 'Task done', Key: k, MRN: r.MRN, LASFIR: r.LASFIR, Note: note }); }
     else if (act === 'sePayerNoteSave'){ const card = $('#seCard').value.trim(), note = $('#seNoteText').value.trim(); closeModal(); await seWrite({ Kind: 'Payer note', Key: a.dataset.p, Value: card, Note: note }); }
+    // 1.2.0: OK to collect (Yes / No, with who and when), desk collections, and the patient lookup
+    else if (act === 'seOk'){ const r = seRow(a.dataset.m); await seWrite({ Kind: 'OK to collect', Key: a.dataset.m, MRN: r.MRN, LASFIR: r.LASFIR, Value: a.dataset.v }); }
+    else if (act === 'seCollect') seCollectDialog(a.dataset.m);
+    else if (act === 'seCollectSave') await seCollectSave(a.dataset.m);
+    else if (act === 'seCollectUndo'){ const r = seRow(a.dataset.m); if (await ask('Take this collection off? It hasn’t reached the admin yet.')) await seWrite({ Kind: 'Collected', Key: a.dataset.k, MRN: r.MRN, LASFIR: r.LASFIR, Value: '', Note: '' }); }
+    else if (act === 'lkSetup') lookupSetupDialog();
+    else if (act === 'lkSave') lookupSave();
+    else if (act === 'lkForget'){ LS.set(CTTLookup.STORE_KEY, ''); render(); }
+    else if (act === 'lkGo') await lookupRun({ mrn: $('#lkMrn').value, purpose: 'unscheduled', reason: $('#lkReason').value, note: $('#lkNote').value });
+    else if (act === 'seMore'){ const r = seRow(a.dataset.m); await lookupRun({ mrn: r.MRN || r.key, purpose: 'scheduled' }); }
+    else if (act === 'lkRetry'){ const q = Object.assign({}, S.lk.q, { note: $('#lkNote2').value }); closeModal(); await lookupRun(q); }
+    else if (act === 'lkCheck'){ const q = Object.assign({}, S.lk.q, { purpose: 'request-check' }); closeModal(); await lookupRun(q); }
+    else if (act === 'lkClose'){ S.lk = null; closeModal(); }
   } catch (err){ console.error(err); busy(false); toast('bad', esc(err.message || String(err)), 9000); }
 });
 // Enter in the add-name field adds it
