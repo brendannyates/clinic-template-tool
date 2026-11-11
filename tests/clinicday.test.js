@@ -78,7 +78,7 @@ function loadApp(Excel, extra){
   sandbox.TE = require('../engine.js'); sandbox.TC = require('../cadence.js'); sandbox.PayerRules = PR; sandbox.SoharCore = C; sandbox.SoharRules = R; sandbox.SoharFees = F; sandbox.CTTPricing = PRICE; sandbox.self = sandbox;
   Object.assign(sandbox, extra || {});
   vm.createContext(sandbox);
-  vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8') + '\n;this.__api = { OfficeStore, S, reload, render, seWrite };', sandbox);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8') + '\n;this.__api = { OfficeStore, S, reload, render, seWrite, openFull, askCloseFull };', sandbox);
   const fire = (k, e) => Promise.all((on[k] || []).map(f => f(e)));
   return { api: sandbox.__api, els, fire, store };
 }
@@ -224,4 +224,29 @@ test('pricing.js: null without fee tables; an intervention is never priced; MD v
   const md = p({ Key: '900102', 'Per Nbr': '602', Event: 'Med Management', Provider: 'Reyes, Sam MD' });
   const np = p({ Key: '900102', 'Per Nbr': '602', Event: 'Med Management', Provider: 'Lark, Jordan PMHNP' });
   assert.ok(md.amount > 0 && np.amount > 0, JSON.stringify([md, np]));
+});
+
+test('full screen (1.2.1): its own window, the in-Excel frame when the browser blocks it, and closing asks first', async () => {
+  const calls = [], unload = {};
+  const dlg = { addEventHandler(){}, messageChild(){}, close(){} };
+  const Office = { onReady(){}, AsyncResultStatus: { Succeeded: 'succeeded', Failed: 'failed' }, EventType: { DialogMessageReceived: 'm', DialogEventReceived: 'e' },
+    context: { ui: { displayDialogAsync(url, opts, cb){ calls.push(JSON.parse(JSON.stringify(opts))); cb(calls.length === 1 ? { status: 'failed', error: { code: 12011, message: 'blocked' } } : { status: 'succeeded', value: dlg }); } } } };
+  const win = { scrollTo(){}, addEventListener: (k, f) => { unload[k] = f; } };
+  const { api, els, fire } = await appWith(bookOf(R.clinicPack('San Rafael', src())), { Office, window: win });
+  api.S.mode = 'pane'; api.openFull();
+  assert.deepEqual(calls.map(o => o.displayInIframe), [false, true], 'own window first, then inside Excel');
+  assert.equal(api.S.full, true);
+  // in full screen: Exit asks, and only Yes closes
+  api.S.mode = 'dialog'; let closed = 0; api.S.store.close = () => { closed++; };
+  const closing = click(fire, { act: 'closeFull' }); await settle();   // waits on the box until Yes
+  assert.match(els['#sheet'].innerHTML, /Close full screen\? Everything you changed is already saved\./);
+  assert.equal(closed, 0);
+  const ev = { prevented: 0, preventDefault(){ this.prevented++; }, returnValue: 'x' };
+  unload.beforeunload(ev);
+  assert.equal(ev.prevented, 1, 'the window X asks through the browser');
+  await click(fire, { act: 'askYes' }); await closing; await settle();
+  assert.equal(closed, 1);
+  const ev2 = { prevented: 0, preventDefault(){ this.prevented++; } };
+  unload.beforeunload(ev2);
+  assert.equal(ev2.prevented, 0, 'no second question after Close full screen');
 });

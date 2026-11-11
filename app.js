@@ -1,7 +1,7 @@
 // Clinic Template Tool: Excel add-in front end. Analysis lives in engine.js (TE).
 // Clinic Eligibility files use Sohar's own core.js / rules.js (SoharCore / SoharRules, byte-identical copies).
 'use strict';
-const APP_VERSION = '1.2.0';   // bump with every ?v= in taskpane.html
+const APP_VERSION = '1.2.1';   // bump with every ?v= in taskpane.html
 const SC = SoharCore, SR = SoharRules;
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -346,9 +346,26 @@ function openFull(){
   const base = location.href.replace(/[?#].*$/, '') + '?mode=dialog&theme=' + S.theme;   // opens in the pane's light / dark
   // the Dev Updates already dismissed here go along, so full screen doesn't show them again
   const url = window.DevUpdates ? DevUpdates.dialogUrl(base) : base;
-  Office.context.ui.displayDialogAsync(url, { height: 95, width: 95, displayInIframe: true }, res => {
-    if (res.status !== Office.AsyncResultStatus.Succeeded){ toast('bad', 'Couldn’t open full screen: ' + esc(res.error && res.error.message)); return; }
-    DLG = res.value; S.full = true; render();
+  // 1.2.1 (Brendan, 11/10): full screen opens in its own window. If the browser blocks the window (Excel on the web
+  // pop-up settings, 12009 / 12011), it opens inside Excel as before, and says so once.
+  const opened = (res, inFrame) => {
+    if (res.status !== Office.AsyncResultStatus.Succeeded){
+      const code = res.error && res.error.code;
+      if (!inFrame && (code === 12009 || code === 12011)){ Office.context.ui.displayDialogAsync(url, FULL_FRAME, r => opened(r, true)); return; }
+      toast('bad', 'Couldn’t open full screen: ' + esc(res.error && res.error.message)); return;
+    }
+    if (inFrame && !S.frameWarned){ S.frameWarned = true; toast('info', 'Full screen opened inside Excel because the browser blocked a new window. Allow pop-ups for Excel to get its own window.', 9000); }
+    wireFull(res.value);
+  };
+  Office.context.ui.displayDialogAsync(url, FULL_WINDOW, r => opened(r, false));
+}
+// Full screen's own window (1.2.1), and the in-Excel frame it falls back to.
+// Excel on the web first shows its own "allow" prompt; that click is what lets the browser open the window.
+const FULL_WINDOW = { height: 95, width: 95, displayInIframe: false };
+const FULL_FRAME = { height: 95, width: 95, displayInIframe: true };
+function wireFull(dlg){
+  {   // the full-screen relay, as before 1.2.1
+    DLG = dlg; S.full = true; render();
     const reply = obj => { try { sendChunks(s => DLG && DLG.messageChild(s), obj); } catch (e){ console.error(e); } };
     toChild = reply; if (window.DevUpdates) DevUpdates.setSend(reply);
     const rx = makeRx(async m => {
@@ -367,8 +384,21 @@ function openFull(){
     });
     DLG.addEventHandler(Office.EventType.DialogMessageReceived, a => rx(a.message));
     DLG.addEventHandler(Office.EventType.DialogEventReceived, () => closedFull());
-  });
+  }
 }
+// Closing full screen asks first (1.2.1): the Exit button through the tool's own box, the window's X through the
+// browser's "Leave site?" box. Every change is already on Clinic Work, so the question is only "did you mean to".
+async function askCloseFull(){
+  const msg = S.saving ? 'A change is still saving. Close full screen anyway? It finishes saving in the side pane.' : 'Close full screen? Everything you changed is already saved.';
+  if (!(await ask(msg, 'Close full screen'))) return false;
+  S.closingFull = true;
+  S.store.close();
+  return true;
+}
+window.addEventListener && window.addEventListener('beforeunload', e => {
+  if (S.mode !== 'dialog' || S.closingFull) return;
+  e.preventDefault(); e.returnValue = '';
+});
 
 // ---------- reading the workbook into the model ----------
 function cfgRows(values, spec){
@@ -1124,7 +1154,9 @@ function seWrite(change){
   const ch = Object.assign({ By: seBy(), When: new Date().toISOString() }, change);
   const rows = SR.workRows(S.data.work, ch);
   S.data.work = rows; runSE(); renderKeepFocus();
+  S.saving = (S.saving || 0) + 1;   // Close full screen says so while a change is on its way
   const p = workQ.then(() => S.store.writeSheet(SR.SE_SHEETS.work, null, { keepFormat: true, inPlace: true, text: true, table: SE_WORK_TABLE, change: ch })); workQ = p.catch(() => {});
+  p.then(() => { S.saving--; }, () => { S.saving--; });
   return p.then(r => {
     // the sheet had rows this pane hadn't seen: show them. Skipped while a later change is on its way (its write hands back newer rows).
     if (r && Array.isArray(r.rows) && S.data.work === rows && JSON.stringify(r.rows) !== JSON.stringify(rows)){ S.data.work = r.rows; runSE(); renderKeepFocus(); }
@@ -1246,7 +1278,7 @@ document.addEventListener('click', async e => {
   try {
     if (act === 'refresh') await reload();
     else if (act === 'full') openFull();
-    else if (act === 'closeFull') S.store.close();
+    else if (act === 'closeFull') await askCloseFull();
     else if (act === 'theme'){
       applyTheme(S.theme === 'dark' ? 'light' : 'dark', true); render(); S.themeSwap = false;
       if (S.mode === 'dialog'){ if (S.store && S.store.send) S.store.send({ ev: 'theme', theme: S.theme }); } else if (toChild) toChild({ ev: 'theme', theme: S.theme });
