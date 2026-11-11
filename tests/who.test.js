@@ -158,13 +158,14 @@ test('toolbar: refresh, full screen, light / dark; the theme is kept and passed 
   // the loading and name screens have no home spot
   o.api.S.picking = true; o.api.render(); assert.ok(!html(o).includes('du-home'));
   const src = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
-  assert.ok(src.includes("displayDialogAsync(url, { height: 95, width: 95, displayInIframe: true }") && !/displayInIframe: false/.test(src), 'in-page dialog only');
+  // 1.2.1 (Brendan, 11/10): its own window first, the in-Excel frame only when the browser blocks the window
+  assert.ok(src.includes("const FULL_WINDOW = { height: 95, width: 95, displayInIframe: false };") && src.includes("const FULL_FRAME = { height: 95, width: 95, displayInIframe: true };"), 'own window, frame fallback');
   assert.ok(src.includes("'?mode=dialog&theme=' + S.theme"), 'full screen opens in the pane’s theme');
 });
 
 test('release: APP_VERSION, package.json and every ?v= agree', () => {
   const v = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8').match(/const APP_VERSION = '([\d.]+)'/)[1];
-  assert.equal(v, '1.2.0');
+  assert.equal(v, '1.2.1');
   assert.equal(JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version, v);
   const found = [...fs.readFileSync(path.join(__dirname, '..', 'taskpane.html'), 'utf8').matchAll(/\?v=([\d.]+)/g)].map(m => m[1]);
   assert.ok(found.length); eq([...new Set(found)], [v]);
