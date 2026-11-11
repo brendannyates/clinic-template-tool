@@ -165,7 +165,7 @@ test('toolbar: refresh, full screen, light / dark; the theme is kept and passed 
 
 test('release: APP_VERSION, package.json and every ?v= agree', () => {
   const v = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8').match(/const APP_VERSION = '([\d.]+)'/)[1];
-  assert.equal(v, '1.2.1');
+  assert.equal(v, '1.3.0');
   assert.equal(JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version, v);
   const found = [...fs.readFileSync(path.join(__dirname, '..', 'taskpane.html'), 'utf8').matchAll(/\?v=([\d.]+)/g)].map(m => m[1]);
   assert.ok(found.length); eq([...new Set(found)], [v]);
