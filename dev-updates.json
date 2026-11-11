@@ -1,6 +1,16 @@
 {
   "updates": [
     {
+      "id": "2026-11-10-clinic-day",
+      "date": "2026-11-10",
+      "bullets": [
+        "New: Clinic Day, the first tab of a new clinic file, lists every visit booked here with coverage, copay, deductible and OOP left, what the patient owes, card on file, OK to collect and copays. The tool keeps it up to date, so don't type on it.",
+        "New: Patients from other clinics who have a visit here are on the list too.",
+        "New: Each patient card has OK to collect (Yes or No, with your name and the time), Record a collection, and a short history.",
+        "New: Look up a patient who isn't on the list, once the admin sets it up on your computer. Every lookup is logged with your name and reason, and nothing it shows is saved in the file."
+      ]
+    },
+    {
       "id": "2026-11-08-bell-home",
       "date": "2026-11-08",
       "bullets": [
