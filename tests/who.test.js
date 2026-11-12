@@ -152,7 +152,7 @@ test('toolbar: refresh, full screen, light / dark; the theme is kept and passed 
   // full screen: the home spot right of the name, and the theme goes up to the pane
   o.api.S.mode = 'dialog'; o.api.S.store.send = m => sent.push(m); o.api.S.store.close = () => {};
   o.api.render(); h = html(o);
-  assert.ok(/<span class="bname">Clinic Template Tool<\/span><span class="du-home" aria-hidden="true"><\/span>/.test(h), 'du-home right of the name');
+  assert.ok(/<span class="bname">Clinic Template Tool<\/span><span class="du-home"><\/span>/.test(h), 'du-home right of the name, not aria-hidden (the bell button lives inside it)');
   assert.ok(h.includes('data-act="closeFull" data-tip="Exit full screen"'));
   await o.click('theme'); eq(sent, [{ ev: 'theme', theme: 'light' }]);
   // the loading and name screens have no home spot
@@ -165,7 +165,7 @@ test('toolbar: refresh, full screen, light / dark; the theme is kept and passed 
 
 test('release: APP_VERSION, package.json and every ?v= agree', () => {
   const v = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8').match(/const APP_VERSION = '([\d.]+)'/)[1];
-  assert.equal(v, '1.3.0');
+  assert.equal(v, '1.3.1');
   assert.equal(JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version, v);
   const found = [...fs.readFileSync(path.join(__dirname, '..', 'taskpane.html'), 'utf8').matchAll(/\?v=([\d.]+)/g)].map(m => m[1]);
   assert.ok(found.length); eq([...new Set(found)], [v]);
