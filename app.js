@@ -1,7 +1,7 @@
 // Clinic Template Tool: Excel add-in front end. Analysis lives in engine.js (TE).
 // Clinic Eligibility files use Sohar's own core.js / rules.js (SoharCore / SoharRules, byte-identical copies).
 'use strict';
-const APP_VERSION = '1.3.0';   // bump with every ?v= in taskpane.html
+const APP_VERSION = '1.3.1';   // bump with every ?v= in taskpane.html
 const SC = SoharCore, SR = SoharRules;
 const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -1242,7 +1242,7 @@ function navHTML(view){
 
 // top right, flush: refresh, full screen (or exit), light / dark (the IVK Tracker's). data-tip is the hover label: what a press
 // does; the theme's is the mode a press switches to. The sun and moon swap places on a change: the one on the right is the
-// one to press. The Dev Update bell is not in the toolbar: in full screen it sits right of the name (.du-home).
+// one to press. The Dev Update bell is not in the toolbar: in full screen it sits inside .du-home, right of the name, and stays put.
 const ICON = {
   refresh: '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v5h-5"/></svg>',
   full: '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>',
@@ -1263,7 +1263,7 @@ function render(){
   if (mustPick()) { $('#app').innerHTML = pickHTML(); const f = $('#whoNew'); if (f && !S.users.length) f.focus(); return; }
   const view = currentView(); const se = SE_VIEWS.includes(view);
   const body = { overview: vOverview, templates: vTemplates, access: vAccess, cadence: vCadence, funnel: vFunnel, recall: vRecall, visits: vVisits, impact: vImpact, trends: vTrends, eligibility: vEligibility, benefits: vBenefits, payers: vPayers, setup: vSetup }[view]();
-  $('#app').innerHTML = `<header class="top"><div class="bar"><div class="brand"><span class="dot" title="Clinic Template Tool ${esc(APP_VERSION)}">CT</span><span class="bname">Clinic Template Tool</span>${S.mode === 'dialog' ? '<span class="du-home" aria-hidden="true"></span>' : ''}<small>${S.R && !se ? `${S.R.tByProv.size} templates · ${num(S.data.ap.rows.length)} visits` : ''}</small></div>
+  $('#app').innerHTML = `<header class="top"><div class="bar"><div class="brand"><span class="dot" title="Clinic Template Tool ${esc(APP_VERSION)}">CT</span><span class="bname">Clinic Template Tool</span>${S.mode === 'dialog' ? '<span class="du-home"></span>' : ''}<small>${S.R && !se ? `${S.R.tByProv.size} templates · ${num(S.data.ap.rows.length)} visits` : ''}</small></div>
     ${S.name ? `<button class="whoami" data-act="switchUser" title="Switch user"><b>${esc(S.name)}</b><small>Switch user</small></button>` : ''}
     ${toolsHTML()}</div>
     ${navHTML(view)}

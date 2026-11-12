@@ -6,7 +6,7 @@
 <meta http-equiv="Content-Security-Policy" content="connect-src 'self'">
 <title>Clinic Template Tool</title>
 <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
-<link rel="stylesheet" href="dev-updates.css?v=1.3.0">
+<link rel="stylesheet" href="dev-updates.css?v=1.3.1">
 <style>
 :root{
   --bg:#f4f5f2;--surface:#fdfdfb;--surface2:#ecefe9;--ink:#22262a;--muted:#62686e;--line:#dde1da;
@@ -27,7 +27,7 @@ html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 "Segoe U
 button,input,select,textarea{font:inherit;color:inherit}
 header.top{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 82%,transparent);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
 .bar{display:flex;align-items:center;gap:8px;padding:10px 12px 6px}
-.brand{font-weight:700;display:flex;align-items:center;gap:8px;flex:1;min-width:0;white-space:nowrap;overflow:hidden}
+.brand{font-weight:700;display:flex;align-items:center;gap:8px;flex:1;min-width:0;white-space:nowrap}   /* no overflow:hidden: it would clip the bell's 44px hit area, hover label and history; .bname and small ellipsize themselves */
 .brand .dot{width:24px;height:24px;border-radius:7px;background:var(--accent);color:var(--accent-ink);display:grid;place-items:center;font-size:11px;font-weight:800;flex:none}
 .brand small{font-weight:500;color:var(--muted);overflow:hidden;text-overflow:ellipsis}
 .iconbtn{border:1px solid var(--line);background:var(--surface);border-radius:10px;min-width:34px;height:34px;display:grid;place-items:center;cursor:pointer;padding:0 8px}
@@ -133,10 +133,12 @@ details.more summary{cursor:pointer;font-size:12.5px;color:var(--muted)}
 @media (prefers-reduced-motion:reduce){.iconbtn.theme.swap .tcur,.iconbtn.theme.swap .tgo{animation:none}}
 /* toolbar hover labels: what the press does */
 .tools .iconbtn[data-tip]:hover::after,.tools .iconbtn[data-tip]:focus-visible::after{content:attr(data-tip);position:absolute;top:calc(100% + 6px);right:0;white-space:nowrap;padding:5px 9px;border-radius:8px;background:var(--ink);color:var(--surface);font-size:12px;font-weight:500;line-height:1.2;pointer-events:none;z-index:60}
-/* Dev Update bell (dev-updates.js / .css, shared): full screen only, at home right of the name (.du-home) */
-.devupd{--font:"Segoe UI",system-ui,-apple-system,sans-serif;--surface-2:var(--line);--surface-3:var(--surface2);--danger:var(--bad);--danger-soft:var(--bad-soft)}
+/* Dev Update bell (dev-updates.js / .css, shared): full screen only, inside .du-home right of the name, static. The 44px box
+   has -12px top and bottom so the bar stays its height, and -4px each side so the 20px icon starts 16px after the name and
+   ends 16px before the next item. The bell lives inside .brand, so it resets the brand's bold, no-wrap text. */
+.devupd{--font:"Segoe UI",system-ui,-apple-system,sans-serif;--surface-2:var(--line);--surface-3:var(--surface2);--danger:var(--bad);--danger-soft:var(--bad-soft);font-weight:400;white-space:normal}
 .brand .bname{overflow:hidden;text-overflow:ellipsis}
-.brand .du-home{margin:-12px -4px -12px -6px}
+.brand .du-home{margin:-12px -4px}
 /* who's using the tool, beside refresh */
 .whoami{border:1px solid var(--line);background:var(--surface);border-radius:10px;height:34px;padding:0 10px;cursor:pointer;display:flex;flex-direction:column;justify-content:center;align-items:flex-start;line-height:1.15;max-width:120px;min-width:0;flex:none}
 .whoami:hover{border-color:var(--accent)}
@@ -164,7 +166,7 @@ details.more summary{cursor:pointer;font-size:12.5px;color:var(--muted)}
 .whonew>summary{cursor:pointer;min-height:44px;display:flex;align-items:center;font-weight:600;color:var(--accent)}
 @media (prefers-reduced-motion:reduce){.spinner{animation-duration:2.4s}}
 @media(max-width:520px){.kpi .v{font-size:19px} th,td{padding:4px 6px}}
-@media(max-width:700px){header.top{position:static}}   /* the filter row would cover a narrow task pane */
+@media(max-width:700px){header.top{position:static;-webkit-backdrop-filter:none;backdrop-filter:none}}   /* the filter row would cover a narrow task pane; a static bar needs no blur, and the blur would make it the frame the bell's fixed history is placed in */
 </style>
 </head>
 <body>
@@ -173,15 +175,15 @@ details.more summary{cursor:pointer;font-size:12.5px;color:var(--muted)}
 <div id="busy" hidden><div id="busyMsg">Working…</div></div>
 <div id="toast"></div>
 <div id="tip" class="tip" hidden></div>
-<script src="engine.js?v=1.3.0"></script>
-<script src="cadence.js?v=1.3.0"></script>
-<script src="payer-rules.js?v=1.3.0"></script>
-<script src="core.js?v=1.3.0"></script>
-<script src="rules.js?v=1.3.0"></script>
-<script src="fees.js?v=1.3.0"></script>
-<script src="pricing.js?v=1.3.0"></script>
-<script src="lookup.js?v=1.3.0"></script>
-<script src="dev-updates.js?v=1.3.0"></script>
-<script src="app.js?v=1.3.0"></script>
+<script src="engine.js?v=1.3.1"></script>
+<script src="cadence.js?v=1.3.1"></script>
+<script src="payer-rules.js?v=1.3.1"></script>
+<script src="core.js?v=1.3.1"></script>
+<script src="rules.js?v=1.3.1"></script>
+<script src="fees.js?v=1.3.1"></script>
+<script src="pricing.js?v=1.3.1"></script>
+<script src="lookup.js?v=1.3.1"></script>
+<script src="dev-updates.js?v=1.3.1"></script>
+<script src="app.js?v=1.3.1"></script>
 </body>
 </html>
